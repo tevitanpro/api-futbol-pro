@@ -3,8 +3,8 @@ import random
 
 app = FastAPI(
     title="API Master Pro - Pinnacle Manual Edition",
-    description="Motor de simulación matemática avanzada de 5,000 escenarios basado 100% en cuotas manuales de Pinnacle",
-    version="4.5.0"
+    description="Motor de simulación matemática avanzada de 20,000 escenarios basado 100% en cuotas manuales de Pinnacle",
+    version="4.6.0"
 )
 
 def simular_escenarios_con_pinnacle(
@@ -74,8 +74,8 @@ def simular_escenarios_con_pinnacle(
     corners_counts = {7.5: 0, 8.5: 0, 9.5: 0, 10.5: 0}
     corners_under_counts = {7.5: 0, 8.5: 0, 9.5: 0, 10.5: 0}
 
-    # 2. Simulación estocástica de los 5,000 escenarios calibrada con Pinnacle
-    for _ in range(5000):
+    # 2. Simulación estocástica de los 20,000 escenarios calibrada con Pinnacle
+    for _ in range(20000):
         ritmo = random.gauss(1.0, 0.14)
         
         # Simulación 1X2
@@ -123,7 +123,7 @@ def simular_escenarios_con_pinnacle(
             else:
                 corners_under_counts[linea] += 1
 
-    n = 5000.0
+    n = 20000.0
     return {
         "p_1": round((exitos_1 / n) * 100.0, 1),
         "p_x": round((exitos_x / n) * 100.0, 1),
@@ -142,7 +142,7 @@ def simular_escenarios_con_pinnacle(
 
 @app.get("/")
 def home():
-    return {"mensaje": "API Master Pro - Motor Estocástico con Cuotas Manuales de Pinnacle"}
+    return {"mensaje": "API Master Pro - Motor Estocástico de 20,000 Escenarios con Cuotas Manuales de Pinnacle"}
 
 # --- RUTA 1: FASE SUPERIOR (Local, Empate, Visitante y Goles con cuotas Pinnacle) ---
 @app.get("/analisis/partido")
@@ -172,7 +172,7 @@ def analizar_partido(
         candidatos_top.sort(key=lambda x: x["prob"], reverse=True)
 
         return {
-            "aviso_legal_licencia": "NOTA: Análisis matemático estocástico avanzado basado en cuotas madre de Pinnacle.",
+            "aviso_legal_licencia": "NOTA: Análisis matemático estocástico avanzado de 20,000 iteraciones basado en cuotas madre de Pinnacle.",
             "origen": "Fase 1 - 1X2 y Goles (Cuotas Manuales Pinnacle)",
             "probabilidades_1x2_simuladas": {
                 "local": f"{sim['p_1']}%",
@@ -190,7 +190,7 @@ def analizar_partido(
                 candidatos_top[1]['texto'],
                 candidatos_top[2]['texto']
             ],
-            "estado": "Simulación de Fase 1 completada con éxito"
+            "estado": "Simulación de Fase 1 completada con éxito (20k escenarios)"
         }
     except Exception as e:
         return {"error": f"Error en el servidor: {str(e)}"}
@@ -235,7 +235,7 @@ def jackbusca_partido(
         )
         
         return {
-            "origen": "JackBusca Fase 2 - Tarjetas y Córners (Motor Estocástico Pinnacle)",
+            "origen": "JackBusca Fase 2 - Tarjetas y Córners (Motor Estocástico Pinnacle 20k)",
             "arbitraje": {
                 "promedio_tarjetas_referencia": promedio_tarjetas_arbitro
             },
@@ -259,7 +259,7 @@ def jackbusca_partido(
                     "10.5": f"{sim['corners_menos'][10.5]}%"
                 }
             },
-            "estado": "JackBusca procesó los mercados secundarios con éxito"
+            "estado": "JackBusca procesó los mercados secundarios con éxito (20k escenarios)"
         }
     except Exception as e:
         return {"error": f"Error en el servidor: {str(e)}"}
