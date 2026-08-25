@@ -142,7 +142,7 @@ def analizar_partido(
                 data_oficial = resp.json()
                 equipo_local = data_oficial.get("homeTeam", {}).get("name", equipo_local)
                 equipo_visitante = data_oficial.get("awayTeam", {}).get("name", equipo_visitante)
-                fuente_final = f"Licencia Oficial Football-Data ({data_oficial.get('competition', {}).get('name', 'Liga Perm.)"
+                fuente_final = f"Licencia Oficial Football-Data ({data_oficial.get('competition', {}).get('name', 'Liga Perm.')})"
 
         # Extraemos fuerzas con tu buscador web de confianza
         datos_publicos = extraer_datos_de_paginas_publicas(equipo_local, equipo_visitante)
