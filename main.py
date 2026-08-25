@@ -1,11 +1,67 @@
 from fastapi import FastAPI
 import random
+from concurrent.futures import ThreadPoolExecutor
 
 app = FastAPI(
-    title="API Master Pro - Pinnacle Manual Edition",
-    description="Motor de simulación matemática avanzada de 20,000 escenarios basado 100% en cuotas manuales de Pinnacle",
-    version="4.6.0"
+    title="API Master Pro - Pinnacle Optimized Edition",
+    description="Motor de simulación matemática avanzada de 50,000 escenarios con procesamiento paralelo",
+    version="5.1.0"
 )
+
+# Función auxiliar que corre un bloque de simulaciones en paralelo
+def _bloque_simulacion(iteraciones, prob_1x2, prob_over_25, prob_over_35, promedio_tarjetas_arbitro, p_t35_base, p_t45_base, corners_bases):
+    p_l, p_e, p_v = prob_1x2
+    exitos_1 = exitos_x = exitos_2 = 0
+    over_25 = under_25 = over_35 = under_35 = 0
+    t_over_35 = t_under_35 = t_over_45 = t_under_45 = 0
+    corners_counts = {7.5: 0, 8.5: 0, 9.5: 0, 10.5: 0}
+    corners_under_counts = {7.5: 0, 8.5: 0, 9.5: 0, 10.5: 0}
+
+    for _ in range(iteraciones):
+        ritmo = random.gauss(1.0, 0.14)
+        
+        # 1X2
+        dado_1x2 = random.uniform(0, 100)
+        if dado_1x2 < p_l:
+            exitos_1 += 1
+        elif dado_1x2 < (p_l + p_e):
+            exitos_x += 1
+        else:
+            exitos_2 += 1
+
+        # Goles
+        if random.uniform(0, 100) < prob_over_25 * ritmo:
+            over_25 += 1
+        else:
+            under_25 += 1
+
+        if random.uniform(0, 100) < prob_over_35 * ritmo:
+            over_35 += 1
+        else:
+            under_35 += 1
+
+        # Tarjetas
+        t_val = random.gauss(promedio_tarjetas_arbitro, 1.2) * ritmo
+        if random.uniform(0, 100) < p_t35_base * (t_val / promedio_tarjetas_arbitro):
+            t_over_35 += 1
+        else:
+            t_under_35 += 1
+
+        if random.uniform(0, 100) < p_t45_base * (t_val / promedio_tarjetas_arbitro):
+            t_over_45 += 1
+        else:
+            t_under_45 += 1
+
+        # Córners
+        c_val = random.gauss(9.5, 2.2) * ritmo
+        for linea in [7.5, 8.5, 9.5, 10.5]:
+            if random.uniform(0, 100) < corners_bases[linea] * (c_val / 9.5):
+                corners_counts[linea] += 1
+            else:
+                corners_under_counts[linea] += 1
+
+    return (exitos_1, exitos_x, exitos_2, over_25, under_25, over_35, under_35, 
+            t_over_35, t_under_35, t_over_45, t_under_45, corners_counts, corners_under_counts)
 
 def simular_escenarios_con_pinnacle(
     cuota_local: float, cuota_empate: float, cuota_visitante: float,
@@ -57,73 +113,39 @@ def simular_escenarios_con_pinnacle(
         10.5: get_prob_over(c_c_mas_105, c_c_menos_105)
     }
 
-    exitos_1 = 0
-    exitos_x = 0
-    exitos_2 = 0
+    # 2. Simulación estocástica paralela de 50,000 escenarios dividida en 4 hilos (aprovechando el i7)
+    total_escenarios = 50000
+    hilos = 4
+    bloque = total_escenarios // hilos
+
+    prob_1x2 = (p_local_real, p_empate_real, p_visitante_real)
+    resultados_hilos = []
+
+    with ThreadPoolExecutor(max_workers=hilos) as executor:
+        futures = [
+            executor.submit(_bloque_simulacion, bloque, prob_1x2, prob_over_25_base, prob_over_35_base, promedio_tarjetas_arbitro, p_t35_base, p_t45_base, corners_bases)
+            for _ in range(hilos)
+        ]
+        for f in futures:
+            resultados_hilos.append(f.result())
+
+    # Consolidar resultados
+    exitos_1 = sum(r[0] for r in resultados_hilos)
+    exitos_x = sum(r[1] for r in resultados_hilos)
+    exitos_2 = sum(r[2] for r in resultados_hilos)
+    over_25_goles = sum(r[3] for r in resultados_hilos)
+    under_25_goles = sum(r[4] for r in resultados_hilos)
+    over_35_goles = sum(r[5] for r in resultados_hilos)
+    under_35_goles = sum(r[6] for r in resultados_hilos)
+    t_over_35 = sum(r[7] for r in resultados_hilos)
+    t_under_35 = sum(r[8] for r in resultados_hilos)
+    t_over_45 = sum(r[9] for r in resultados_hilos)
+    t_under_45 = sum(r[10] for r in resultados_hilos)
     
-    over_25_goles = 0
-    under_25_goles = 0
-    over_35_goles = 0
-    under_35_goles = 0
-    
-    t_over_35 = 0
-    t_under_35 = 0
-    t_over_45 = 0
-    t_under_45 = 0
-    
-    corners_counts = {7.5: 0, 8.5: 0, 9.5: 0, 10.5: 0}
-    corners_under_counts = {7.5: 0, 8.5: 0, 9.5: 0, 10.5: 0}
+    corners_counts = {k: sum(r[11][k] for r in resultados_hilos) for k in [7.5, 8.5, 9.5, 10.5]}
+    corners_under_counts = {k: sum(r[12][k] for r in resultados_hilos) for k in [7.5, 8.5, 9.5, 10.5]}
 
-    # 2. Simulación estocástica de los 20,000 escenarios calibrada con Pinnacle
-    for _ in range(20000):
-        ritmo = random.gauss(1.0, 0.14)
-        
-        # Simulación 1X2
-        dado_1x2 = random.uniform(0, 100)
-        if dado_1x2 < p_local_real:
-            exitos_1 += 1
-        elif dado_1x2 < (p_local_real + p_empate_real):
-            exitos_x += 1
-        else:
-            exitos_2 += 1
-
-        # Simulación Goles basada en la tendencia de sus cuotas
-        dado_g25 = random.uniform(0, 100)
-        if dado_g25 < prob_over_25_base * ritmo:
-            over_25_goles += 1
-        else:
-            under_25_goles += 1
-
-        dado_g35 = random.uniform(0, 100)
-        if dado_g35 < prob_over_35_base * ritmo:
-            over_35_goles += 1
-        else:
-            under_35_goles += 1
-
-        # Simulación Tarjetas influenciada por el árbitro y cuotas
-        t_val = random.gauss(promedio_tarjetas_arbitro, 1.2) * ritmo
-        dado_t35 = random.uniform(0, 100)
-        if dado_t35 < p_t35_base * (t_val / promedio_tarjetas_arbitro):
-            t_over_35 += 1
-        else:
-            t_under_35 += 1
-
-        dado_t45 = random.uniform(0, 100)
-        if dado_t45 < p_t45_base * (t_val / promedio_tarjetas_arbitro):
-            t_over_45 += 1
-        else:
-            t_under_45 += 1
-
-        # Simulación Tiros de Esquina
-        c_val = random.gauss(9.5, 2.2) * ritmo
-        for linea in [7.5, 8.5, 9.5, 10.5]:
-            dado_c = random.uniform(0, 100)
-            if dado_c < corners_bases[linea] * (c_val / 9.5):
-                corners_counts[linea] += 1
-            else:
-                corners_under_counts[linea] += 1
-
-    n = 20000.0
+    n = float(total_escenarios)
     return {
         "p_1": round((exitos_1 / n) * 100.0, 1),
         "p_x": round((exitos_x / n) * 100.0, 1),
@@ -142,7 +164,7 @@ def simular_escenarios_con_pinnacle(
 
 @app.get("/")
 def home():
-    return {"mensaje": "API Master Pro - Motor Estocástico de 20,000 Escenarios con Cuotas Manuales de Pinnacle"}
+    return {"mensaje": "API Master Pro - Motor Estocástico de 50,000 Escenarios con Cuotas Manuales de Pinnacle"}
 
 # --- RUTA 1: FASE SUPERIOR (Local, Empate, Visitante y Goles con cuotas Pinnacle) ---
 @app.get("/analisis/partido")
@@ -172,7 +194,7 @@ def analizar_partido(
         candidatos_top.sort(key=lambda x: x["prob"], reverse=True)
 
         return {
-            "aviso_legal_licencia": "NOTA: Análisis matemático estocástico avanzado de 20,000 iteraciones basado en cuotas madre de Pinnacle.",
+            "aviso_legal_licencia": "NOTA: Análisis matemático estocástico avanzado de 50,000 iteraciones basado en cuotas madre de Pinnacle.",
             "origen": "Fase 1 - 1X2 y Goles (Cuotas Manuales Pinnacle)",
             "probabilidades_1x2_simuladas": {
                 "local": f"{sim['p_1']}%",
@@ -190,7 +212,7 @@ def analizar_partido(
                 candidatos_top[1]['texto'],
                 candidatos_top[2]['texto']
             ],
-            "estado": "Simulación de Fase 1 completada con éxito (20k escenarios)"
+            "estado": "Simulación de Fase 1 completada con éxito (50k escenarios)"
         }
     except Exception as e:
         return {"error": f"Error en el servidor: {str(e)}"}
@@ -235,7 +257,7 @@ def jackbusca_partido(
         )
         
         return {
-            "origen": "JackBusca Fase 2 - Tarjetas y Córners (Motor Estocástico Pinnacle 20k)",
+            "origen": "JackBusca Fase 2 - Tarjetas y Córners (Motor Estocástico Pinnacle 50k)",
             "arbitraje": {
                 "promedio_tarjetas_referencia": promedio_tarjetas_arbitro
             },
@@ -259,7 +281,7 @@ def jackbusca_partido(
                     "10.5": f"{sim['corners_menos'][10.5]}%"
                 }
             },
-            "estado": "JackBusca procesó los mercados secundarios con éxito (20k escenarios)"
+            "estado": "JackBusca procesó los mercados secundarios con éxito (50k escenarios)"
         }
     except Exception as e:
         return {"error": f"Error en el servidor: {str(e)}"}
