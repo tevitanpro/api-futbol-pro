@@ -292,7 +292,8 @@
                 const recList = document.getElementById('res-rec');
                 recList.innerHTML = '';
                 data.top_3_recomendaciones.forEach((rec, idx) => {
-                    recList.innerHTML += `<li style="margin-bottom: 6px;"><span>${idx + 1}. ${rec}</span></li>`;
+                    const itemNum = idx + 1;
+                    recList.innerHTML += '<li style="margin-bottom: 6px;"><span>' + itemNum + '. ' + rec + '</span></li>';
                 });
 
                 // Pintar Goles
