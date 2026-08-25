@@ -3,23 +3,25 @@ import random
 import requests
 from bs4 import BeautifulSoup
 
-app = FastAPI()
+app = FastAPI(
+    title="API Master Pro - JackBusca Edition",
+    description="Motor de scraping, licencias oficiales y simulador de 5,000 escenarios",
+    version="1.0.0"
+)
+
+# Tu token oficial de football-data.org
+FOOTBALL_DATA_TOKEN = "8bfb194efbf74b418e00bfb575408368"
+HEADERS = {"X-Auth-Token": FOOTBALL_DATA_TOKEN}
 
 def extraer_datos_de_paginas_publicas(equipo_local: str, equipo_visitante: str) -> dict:
-    """
-    Entra a buscadores y páginas públicas abiertas (igual que un navegador) 
-    para extraer tendencias, estadísticas o menciones reales del partido.
-    """
     fuerza_l = 50.0
     fuerza_e = 26.0
     fuente_usada = "Motor Estadístico Base (Público)"
     
     try:
-        # Armamos una consulta pública orientada a estadísticas abiertas
         query = f"{equipo_local} vs {equipo_visitante} estadisticas pronostico"
         url_busqueda = f"https://html.duckduckgo.com/html/?q={requests.utils.quote(query)}"
         
-        # Simulamos ser un navegador real con un buen User-Agent
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         }
@@ -35,7 +37,6 @@ def extraer_datos_de_paginas_publicas(equipo_local: str, equipo_visitante: str) 
                 if s and s.text:
                     texto_acumulado += s.text.lower() + " "
             
-            # Si encontramos texto público sobre los equipos, ajustamos la balanza real
             l_lower = equipo_local.lower()
             v_lower = equipo_visitante.lower()
             
@@ -44,11 +45,10 @@ def extraer_datos_de_paginas_publicas(equipo_local: str, equipo_visitante: str) 
             
             if len(texto_acumulado) > 100:
                 fuente_usada = "Web Scraping de Fuentes Públicas Abiertas"
-                # Ajuste proporcional basado en el análisis de texto público encontrado
                 if menciones_l > menciones_v:
-                    fuerza_l = 55.0  # El local toma ventaja según la data pública
+                    fuerza_l = 55.0 
                 elif menciones_v > menciones_l:
-                    fuerza_l = 45.0  # La visita toma fuerza según la data pública
+                    fuerza_l = 45.0 
                     
     except Exception as e:
         print(f"Nota de scraping público: {e}")
@@ -62,7 +62,6 @@ def extraer_datos_de_paginas_publicas(equipo_local: str, equipo_visitante: str) 
     }
 
 def simular_5000_escenarios(p_base_local: float, p_base_empate: float, p_base_visita: float) -> dict:
-    """Ejecuta las 5,000 simulaciones estadísticas basadas en los datos públicos recolectados"""
     exitos_1 = 0
     exitos_x = 0
     exitos_2 = 0
@@ -122,26 +121,38 @@ def simular_5000_escenarios(p_base_local: float, p_base_empate: float, p_base_vi
 
 @app.get("/")
 def home():
-    return {"mensaje": "API Master Pro - Extracción de Páginas Públicas y Simulador Activos"}
+    return {"mensaje": "API Master Pro - Listos para operar con licencia y simulador"}
 
+# --- RUTA 1: ANALISIS OFICIAL (Con licencia y respaldo web) ---
 @app.get("/analisis/partido")
 def analizar_partido(
     equipo_local: str, 
     equipo_visitante: str, 
+    match_id_oficial: int = 0,
     arbitro_manual: str = ""
 ):
     try:
-        # 1. Extraemos los datos de las fuentes públicas abiertas
-        datos_publicos = extraer_datos_de_paginas_publicas(equipo_local, equipo_visitante)
+        fuente_final = "Motor Web Publico + Simulador"
         
+        # Si pones un ID oficial de tu licencia de football-data.org
+        if match_id_oficial > 0:
+            url = f"https://api.football-data.org/v4/matches/{match_id_oficial}"
+            resp = requests.get(url, headers=HEADERS)
+            if resp.status_code == 200:
+                data_oficial = resp.json()
+                equipo_local = data_oficial.get("homeTeam", {}).get("name", equipo_local)
+                equipo_visitante = data_oficial.get("awayTeam", {}).get("name", equipo_visitante)
+                fuente_final = f"Licencia Oficial Football-Data ({data_oficial.get('competition', {}).get('name', 'Liga Perm.)"
+
+        # Extraemos fuerzas con tu buscador web de confianza
+        datos_publicos = extraer_datos_de_paginas_publicas(equipo_local, equipo_visitante)
         base_l = datos_publicos["fuerza_l"]
         base_e = datos_publicos["fuerza_e"]
         base_v = datos_publicos["fuerza_v"]
-        estado_fuente = datos_publicos["fuente"]
         
-        arbitro_final = arbitro_manual.strip() if arbitro_manual.strip() else "Por asignar (Revisar plataforma pública)"
+        arbitro_final = arbitro_manual.strip() if arbitro_manual.strip() else "Por asignar (Revisar plataforma)"
 
-        # 2. Corremos las 5,000 simulaciones estrictamente con esos datos públicos
+        # Corremos tus 5000 simulaciones exactas
         sim = simular_5000_escenarios(base_l, base_e, base_v)
         
         candidatos_top = [
@@ -154,19 +165,20 @@ def analizar_partido(
         candidatos_top.sort(key=lambda x: x["prob"], reverse=True)
 
         return {
+            "aviso_legal_licencia": "NOTA: Esta ruta soporta ligas de la licencia oficial (WC, Champions, Premier, LaLiga, Serie A, Bundesliga, Eredivisie, Brasileirao, Ligue 1, Championship, Eredivisie, Primeira Liga).",
             "encuentro": f"{equipo_local.title()} vs {equipo_visitante.title()}",
-            "fuente_extraccion": estado_fuente,
+            "fuente_extraccion": fuente_final,
             "designacion_arbitral": arbitro_final,
             "probabilidades_1x2_simuladas": {
                 "local": f"{sim['p_1']}%",
                 "empate": f"{sim['p_x']}%",
                 "visitante": f"{sim['p_2']}%"
             },
-            "mercados_clave": {
-                "btts": f"{sim['btts']}%",
-                "over_25": f"{sim['over_25']}%",
-                "corners_mas_95": f"{sim['corners_mas_95']}%",
-                "tarjetas_mas_45": f"{sim['tarjetas_mas_45']}%",
+            "mercados_clave_explicados": {
+                "btts_ambos_marcan": f"{sim['btts']}% (Probabilidad de que tanto local como visitante logren anotar al menos 1 gol)",
+                "over_25_goles": f"{sim['over_25']}% (Probabilidad de que el partido termine con más de 2.5 goles totales)",
+                "corners_mas_de_95": f"{sim['corners_mas_95']}% (Probabilidad proyectada de superar los 9.5 tiros de esquina en total)",
+                "tarjetas_mas_de_45": f"{sim['tarjetas_mas_45']}% (Probabilidad de superar las 4.5 tarjetas en el encuentro)",
                 "proyeccion_tiros": f"Puerta (~{sim['media_tiros_puerta']}) | Totales (~{sim['media_tiros_totales']})"
             },
             "top_3_recomendaciones": [
@@ -174,7 +186,74 @@ def analizar_partido(
                 candidatos_top[1]['texto'],
                 candidatos_top[2]['texto']
             ],
-            "estado": "Datos de páginas públicas extraídos y 5,000 simulaciones ejecutadas con éxito"
+            "estado": "Simulación completada con éxito"
+        }
+    except Exception as e:
+        return {"error": f"Error en el servidor: {str(e)}"}
+
+
+# --- RUTA 2: JACKBUSCA / PARTIDO (Para ligas locales, Conmebol, Asia, Centroamérica y manuales) ---
+@app.get("/jackbusca/partido")
+def jackbusca_partido(
+    equipo_local: str, 
+    equipo_visitante: str, 
+    competencia: str = "Liga Local / Torneo Nacional",
+    ultimos_5_local_resumen: str = "Ej: 3 Ganados, 1 Empate, 1 Perdido (Buen Local)",
+    ultimos_5_visitante_resumen: str = "Ej: 1 Ganado, 1 Empate, 3 Perdidos (Mal Visitante)",
+    arbitro_asignado: str = "Por definir",
+    promedio_tarjetas_arbitro: float = 4.5,
+    fuerza_local_manual: float = 50.0,
+    fuerza_empate_manual: float = 26.0
+):
+    try:
+        # El orden estricto ingresado define local y visitante
+        base_l = fuerza_local_manual
+        base_e = fuerza_empate_manual
+        base_v = round(100.0 - (base_l + base_e), 1)
+
+        sim = simular_5000_escenarios(base_l, base_e, base_v)
+        
+        candidatos_top = [
+            {"prob": sim['p_1'], "texto": f"Victoria {equipo_local.title()}: {sim['p_1']}%"},
+            {"prob": sim['p_x'], "texto": f"Empate Técnico: {sim['p_x']}%"},
+            {"prob": sim['p_2'], "texto": f"Victoria {equipo_visitante.title()}: {sim['p_2']}%"},
+            {"prob": sim['btts'], "texto": f"Ambos Marcan (BTTS): {sim['btts']}%"},
+            {"prob": sim['over_25'], "texto": f"Más de 2.5 Goles: {sim['over_25']}%"}
+        ]
+        candidatos_top.sort(key=lambda x: x["prob"], reverse=True)
+
+        return {
+            "origen": "JackBusca Simulador Especializado",
+            "competencia": competencia,
+            "encuentro_orden_estricto": {
+                "local": equipo_local.title(),
+                "visitante": equipo_visitante.title()
+            },
+            "analisis_rachas_ultimos_5": {
+                "tendencia_local": ultimos_5_local_resumen,
+                "tendencia_visitante": ultimos_5_visitante_resumen
+            },
+            "arbitraje": {
+                "nombre_arbitro": arbitro_asignado,
+                "promedio_tarjetas_partido": promedio_tarjetas_arbitro
+            },
+            "probabilidades_1x2_simuladas": {
+                "local": f"{sim['p_1']}%",
+                "empate": f"{sim['p_x']}%",
+                "visitante": f"{sim['p_2']}%"
+            },
+            "mercados_clave_explicados": {
+                "btts_ambos_marcan": f"{sim['btts']}% (Ambos equipos anotan)",
+                "over_25_goles": f"{sim['over_25']}% (Más de 2.5 goles totales)",
+                "corners_mas_de_95": f"{sim['corners_mas_95']}% (Más de 9.5 tiros de esquina)",
+                "tarjetas_mas_de_45": f"{sim['tarjetas_mas_45']}% (Más de 4.5 tarjetas en total)"
+            },
+            "top_3_recomendaciones": [
+                candidatos_top[0]['texto'],
+                candidatos_top[1]['texto'],
+                candidatos_top[2]['texto']
+            ],
+            "estado": "JackBusca procesó los 5,000 escenarios con éxito"
         }
     except Exception as e:
         return {"error": f"Error en el servidor: {str(e)}"}
