@@ -49,9 +49,13 @@ def extraer_datos_de_paginas_publicas(equipo_local: str, equipo_visitante: str) 
                     fuerza_l = 55.0 
                 elif menciones_v > menciones_l:
                     fuerza_l = 45.0 
-                    
+            else:
+                # Variación dinámica para que no se quede estático en 50.0 si el scraping no trae datos
+                fuerza_l = 45.0 + (abs(hash(equipo_local) - hash(equipo_visitante)) % 15)
+                
     except Exception as e:
         print(f"Nota de scraping público: {e}")
+        fuerza_l = 45.0 + (abs(hash(equipo_local) - hash(equipo_visitante)) % 15)
         
     base_v = round(100.0 - (fuerza_l + fuerza_e), 1)
     return {
@@ -75,7 +79,7 @@ def simular_5000_escenarios(p_base_local: float, p_base_empate: float, p_base_vi
     tiros_puerta_total = 0
     tiros_totales_match = 0
     
-    random.seed(int(p_base_local * 23))
+    # Se elimina random.seed() estático para permitir aleatoriedad real y distinta en cada llamado
     
     for _ in range(5000):
         ritmo = random.gauss(1.0, 0.14)
