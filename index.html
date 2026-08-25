@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tevitan Pro - Simulador Estocástico de Apuestas</title>
+    <!-- Google Fonts -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            font-family: 'Inter', sans-serif;
+        }
+        body {
+            background-color: #0f172a;
+            color: #f8fafc;
+            padding: 20px;
+        }
+        .container {
+            max-width: 900px;
+            margin: 0 auto;
+        }
+        header {
+            text-align: center;
+            margin-bottom: 30px;
+        }
+        header h1 {
+            color: #38bdf8;
+            font-size: 2.5rem;
+            margin-bottom: 5px;
+        }
+        header p {
+            color: #94a3b8;
+        }
+        .card {
+            background-color: #1e293b;
+            border-radius: 12px;
+            padding: 25px;
+            box-shadow: 0 10px 25px rgba(0,0,0,0.3);
+            margin-bottom: 25px;
+        }
+        h2 {
+            font-size: 1.25rem;
+            margin-bottom: 15px;
+            color: #e2e8f0;
+            border-bottom: 2px solid #334155;
+            padding-bottom: 8px;
+        }
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+        }
+        .input-group {
+            display: flex;
+            flex-direction: column;
+        }
+        label {
+            font-size: 0.85rem;
+            color: #94a3b8;
+            margin-bottom: 5px;
+        }
+        input {
+            background-color: #0f172a;
+            border: 1px solid #475569;
+            border-radius: 8px;
+            color: #fff;
+            padding: 10px;
+            font-size: 1rem;
+            outline: none;
+            transition: border-color 0.2s;
+        }
+        input:focus {
+            border-color: #38bdf8;
+        }
+        .btn-simular {
+            width: 100%;
+            background: linear-gradient(135deg, #0284c7, #0369a1);
+            color: white;
+            border: none;
+            padding: 15px;
+            font-size: 1.1rem;
+            font-weight: 600;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: opacity 0.2s;
+        }
+        .btn-simular:hover {
+            opacity: 0.9;
+        }
+        .results {
+            display: none;
+        }
+        .results-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+        }
+        .result-box {
+            background-color: #0f172a;
+            padding: 15px;
+            border-radius: 8px;
+            border-left: 4px solid #38bdf8;
+        }
+        .result-box h3 {
+            font-size: 1rem;
+            color: #38bdf8;
+            margin-bottom: 10px;
+        }
+        .result-box ul {
+            list-style: none;
+        }
+        .result-box li {
+            padding: 4px 0;
+            font-size: 0.95rem;
+            color: #cbd5e1;
+        }
+        .loading {
+            text-align: center;
+            color: #38bdf8;
+            font-size: 1.1rem;
+            margin: 20px 0;
+            display: none;
+        }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <header>
+        <h1>⚡ Tevitan Pro</h1>
+        <p>Motor de Simulación Estocástica de 5,000 Escenarios (Base Pinnacle)</p>
+    </header>
+
+    <!-- Formulario de Cuotas -->
+    <div class="card">
+        <h2>📊 1. Mercado Principal (1X2)</h2>
+        <div class="grid">
+            <div class="input-group">
+                <label>Cuota Local (1)</label>
+                <input type="number" id="cuota_local" step="0.01" value="3.03">
+            </div>
+            <div class="input-group">
+                <label>Cuota Empate (X)</label>
+                <input type="number" id="cuota_empate" step="0.01" value="3.26">
+            </div>
+            <div class="input-group">
+                <label>Cuota Visitante (2)</label>
+                <input type="number" id="cuota_visitante" step="0.01" value="2.56">
+            </div>
+        </div>
+    </div>
+
+    <div class="card">
+        <h2>⚽ 2. Mercado de Goles (Over / Under)</h2>
+        <div class="grid">
+            <div class="input-group">
+                <label>Más de 2.5 Goles</label>
+                <input type="number" id="cuota_mas_25_goles" step="0.01" value="1.95">
+            </div>
+            <div class="input-group">
+                <label>Menos de 2.5 Goles</label>
+                <input type="number" id="cuota_menos_25_goles" step="0.01" value="1.85">
+            </div>
+            <div class="input-group">
+                <label>Más de 3.5 Goles</label>
+                <input type="number" id="cuota_mas_35_goles" step="0.01" value="3.40">
+            </div>
+            <div class="input-group">
+                <label>Menos de 3.5 Goles</label>
+                <input type="number" id="cuota_menos_35_goles" step="0.01" value="1.32">
+            </div>
+        </div>
+    </div>
+
+    <button class="btn-simular" onclick="ejecutarSimulacion()">🚀 Ejecutar Simulación de 5,000 Escenarios</button>
+
+    <div class="loading" id="loading">⏳ Corriendo simulaciones estocásticas en el servidor...</div>
+
+    <!-- Resultados -->
+    <div class="card results" id="resultsCard" style="margin-top: 25px;">
+        <h2>🎯 Resultados del Análisis Técnico</h2>
+        <div class="results-grid">
+            <div class="result-box">
+                <h3>Probabilidades 1X2</h3>
+                <ul id="res-1x2"></ul>
+            </div>
+            <div class="result-box">
+                <h3>Top 3 Recomendaciones</h3>
+                <ul id="res-rec"></ul>
+            </div>
+            <div class="result-box">
+                <h3>Mercados Clave (Goles)</h3>
+                <ul id="res-goles"></ul>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+    async function ejecutarSimulacion() {
+        const loading = document.getElementById('loading');
+        const resultsCard = document.getElementById('resultsCard');
+        
+        loading.style.display = 'block';
+        resultsCard.style.display = 'none';
+
+        // Recolectar valores de los inputs
+        const params = new URLSearchParams({
+            cuota_local: document.getElementById('cuota_local').value,
+            cuota_empate: document.getElementById('cuota_empate').value,
+            cuota_visitante: document.getElementById('cuota_visitante').value,
+            cuota_mas_25_goles: document.getElementById('cuota_mas_25_goles').value,
+            cuota_menos_25_goles: document.getElementById('cuota_menos_25_goles').value,
+            cuota_mas_35_goles: document.getElementById('cuota_mas_35_goles').value,
+            cuota_menos_35_goles: document.getElementById('cuota_menos_35_goles').value,
+        });
+
+        try {
+            const response = await fetch(`https://api-futbol-pro.onrender.com/analisis/partido?${params.toString()}`);
+            const data = await response.json();
+
+            if (response.ok) {
+                // Pintar Probabilidades 1X2
+                const probList = document.getElementById('res-1x2');
+                probList.innerHTML = `
+                    <li>Local: <strong>${data.probabilidades_1x2_simuladas.local}</strong></li>
+                    <li>Empate: <strong>${data.probabilidades_1x2_simuladas.empate}</strong></li>
+                    <li>Visitante: <strong>${data.probabilidades_1x2_simuladas.visitante}</strong></li>
+                `;
+
+                // Pintar Top 3
+                const recList = document.getElementById('res-rec');
+                recList.innerHTML = '';
+                data.top_3_recomendaciones.forEach((rec, idx) => {
+                    recList.innerHTML += `<li>${idx + 1}. ${rec}</li>`;
+                });
+
+                // Pintar Goles
+                const golesList = document.getElementById('res-goles');
+                const g = data.mercados_clave_goles;
+                golesList.innerHTML = `
+                    <li>Más 2.5: <strong>${g.mas_de_2.5_goles}</strong></li>
+                    <li>Menos 2.5: <strong>${g.menos_de_2.5_goles}</strong></li>
+                    <li>Más 3.5: <strong>${g.mas_de_3.5_goles}</strong></li>
+                    <li>Menos 3.5: <strong>${g.menos_de_3.5_goles}</strong></li>
+                `;
+
+                resultsCard.style.display = 'block';
+            } else {
+                alert("Error al procesar la simulación en la API.");
+            }
+        } catch (error) {
+            alert("Error de conexión con el servidor: " + error.message);
+        } finally {
+            loading.style.display = 'none';
+        }
+    }
+</script>
+
+</body>
+</html>
