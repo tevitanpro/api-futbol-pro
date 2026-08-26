@@ -19,7 +19,7 @@ from fastapi import Request
 app = FastAPI(
     title="API Master Pro - Pinnacle Optimized Edition",
     description="Motor de simulación matemática avanzada de 50,000 escenarios con base de datos e historial",
-    version="8.7.0"
+    version="8.8.0"
 )
 
 # ==========================================
@@ -532,11 +532,43 @@ def guardar_historial(data: GuardarHistorialSchema, user=Depends(_current_user))
 
 @app.get("/historial/{usuario}")
 def ver_historial(usuario: str, request: Request, user=Depends(_current_user)):
+    # El usuario nunca puede consultar el historial de otra cuenta.
     if usuario != user['usuario']:
         raise HTTPException(status_code=403, detail="No autorizado.")
     limite = PREMIUM_HISTORY_LIMIT if user['plan'] in PLANS else FREE_HISTORY_LIMIT
-    conn=_db(); rows=conn.execute("SELECT fecha,partido_resumen,datos_json FROM historial WHERE usuario=? ORDER BY id DESC LIMIT ?",(usuario,limite)).fetchall(); conn.close()
-    return {"usuario":usuario,"limite":limite,"historial":[{"fecha":r['fecha'],"partido":r['partido_resumen'],"detalles":r['datos_json']} for r in rows]}
+    conn=_db()
+    rows=conn.execute("SELECT id,fecha,partido_resumen,datos_json FROM historial WHERE usuario=? ORDER BY id DESC LIMIT ?",(usuario,limite)).fetchall()
+    total=conn.execute("SELECT COUNT(*) c FROM historial WHERE usuario=?",(usuario,)).fetchone()['c']
+    conn.close()
+    historial=[]
+    for r in rows:
+        try:
+            datos=json.loads(r['datos_json']) if r['datos_json'] else {}
+        except Exception:
+            datos={"detalle":r['datos_json']}
+        historial.append({"id":r['id'],"fecha":r['fecha'],"partido":r['partido_resumen'],"datos":datos})
+    return {"usuario":usuario,"plan":user['plan'],"limite":limite,"usados":min(int(total),limite),"restantes":max(0,limite-min(int(total),limite)),"historial":historial}
+
+@app.get("/historial/item/{historial_id}")
+def ver_item_historial(historial_id: int, user=Depends(_current_user)):
+    conn=_db(); row=conn.execute("SELECT id,fecha,partido_resumen,datos_json FROM historial WHERE id=? AND usuario=?",(historial_id,user['usuario'])).fetchone(); conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="Análisis no encontrado en tu historial.")
+    try:
+        datos=json.loads(row['datos_json']) if row['datos_json'] else {}
+    except Exception:
+        datos={"detalle":row['datos_json']}
+    return {"id":row['id'],"fecha":row['fecha'],"partido":row['partido_resumen'],"datos":datos}
+
+@app.delete("/historial/item/{historial_id}")
+def eliminar_item_historial(historial_id: int, user=Depends(_current_user)):
+    conn=_db()
+    row=conn.execute("SELECT id FROM historial WHERE id=? AND usuario=?",(historial_id,user['usuario'])).fetchone()
+    if not row:
+        conn.close(); raise HTTPException(status_code=404, detail="Análisis no encontrado en tu historial.")
+    conn.execute("DELETE FROM historial WHERE id=? AND usuario=?",(historial_id,user['usuario']))
+    conn.commit(); conn.close()
+    return {"ok":True,"mensaje":"Análisis eliminado de tu historial."}
 
 # ==========================================
 # MOTOR DE SIMULACIÓN ESTOCÁSTICA (50k ESCENARIOS)
