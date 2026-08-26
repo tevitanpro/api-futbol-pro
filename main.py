@@ -370,7 +370,7 @@ def simular_escenarios_con_pinnacle(
 def home():
     return {"mensaje": "API Master Pro - Motor Estocástico con Base de Datos e Historial Activo"}
 
-# --- RUTA 1: FASE SUPERIOR ---
+# --- RUTA 1: FASE SUPERIOR (CORREGIDA PARA VARIABILIDAD EN TOP 3) ---
 @app.get("/analisis/partido")
 def analizar_partido(
     cuota_local: float = 3.03,
@@ -388,10 +388,14 @@ def analizar_partido(
             cuota_mas_35_goles, cuota_menos_35_goles
         )
         
-        candidatos_top = [
+        # Separamos en grupos lógicos para garantizar diversidad y evitar que el BTTS monopolice siempre el top
+        candidatos_1x2 = [
             {"prob": sim['p_1'], "texto": f"Victoria Local (1): {sim['p_1']}%"},
             {"prob": sim['p_x'], "texto": f"Empate Técnico (X): {sim['p_x']}%"},
-            {"prob": sim['p_2'], "texto": f"Victoria Visitante (2): {sim['p_2']}%"},
+            {"prob": sim['p_2'], "texto": f"Victoria Visitante (2): {sim['p_2']}%"}
+        ]
+        
+        candidatos_goles_btts = [
             {"prob": sim['over_25'], "texto": f"Más de 2.5 Goles: {sim['over_25']}%"},
             {"prob": sim['under_25'], "texto": f"Menos de 2.5 Goles: {sim['under_25']}%"},
             {"prob": sim['over_35'], "texto": f"Más de 3.5 Goles: {sim['over_35']}%"},
@@ -399,7 +403,20 @@ def analizar_partido(
             {"prob": sim['btts_si'], "texto": f"Ambos Anotan (Sí): {sim['btts_si']}%"},
             {"prob": sim['btts_no'], "texto": f"Ambos Anotan (No): {sim['btts_no']}%"}
         ]
-        candidatos_top.sort(key=lambda x: x["prob"], reverse=True)
+
+        # Ordenamos de mayor a menor probabilidad independientemente
+        candidatos_1x2.sort(key=lambda x: x["prob"], reverse=True)
+        candidatos_goles_btts.sort(key=lambda x: x["prob"], reverse=True)
+
+        # Construimos un Top 3 balanceado (1 del mercado de ganador y 2 de goles/BTTS)
+        top_3_variado = [
+            candidatos_1x2[0],          
+            candidatos_goles_btts[0],   
+            candidatos_goles_btts[1]    
+        ]
+        
+        # Ordenamos estéticamente el top 3 final por porcentaje de mayor a menor
+        top_3_variado.sort(key=lambda x: x["prob"], reverse=True)
 
         return {
             "aviso_legal_licencia": "NOTA: Análisis matemático estocástico avanzado de 50,000 iteraciones.",
@@ -418,9 +435,9 @@ def analizar_partido(
                 "btts_no": f"{sim['btts_no']}%"
             },
             "top_3_recomendaciones": [
-                candidatos_top[0]['texto'],
-                candidatos_top[1]['texto'],
-                candidatos_top[2]['texto']
+                top_3_variado[0]['texto'],
+                top_3_variado[1]['texto'],
+                top_3_variado[2]['texto']
             ],
             "estado": "Simulación completada con éxito (50k escenarios)"
         }
