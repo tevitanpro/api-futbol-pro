@@ -1,4 +1,5 @@
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 import random
 from concurrent.futures import ThreadPoolExecutor
 
@@ -6,6 +7,15 @@ app = FastAPI(
     title="API Master Pro - Pinnacle Optimized Edition",
     description="Motor de simulación matemática avanzada de 50,000 escenarios con procesamiento paralelo",
     version="5.1.0"
+)
+
+# Configuración de CORS para permitir conexiones desde Vercel o cualquier origen
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # Función auxiliar que corre un bloque de simulaciones en paralelo
