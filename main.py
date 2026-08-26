@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 app = FastAPI(
     title="API Master Pro - Pinnacle Optimized Edition",
     description="Motor de simulación matemática avanzada de 50,000 escenarios con base de datos e historial",
-    version="8.1.0"
+    version="8.0.0"
 )
 
 # Configuración de CORS
@@ -28,6 +28,7 @@ def inicializar_db():
     conn = sqlite3.connect("database.db")
     cursor = conn.cursor()
     
+    # Tabla de Usuarios (Registro gratuito con usuario, correo y contraseña)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS usuarios (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -40,6 +41,7 @@ def inicializar_db():
         )
     """)
     
+    # Tabla de Historial de Análisis
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS historial (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -54,6 +56,7 @@ def inicializar_db():
 
 inicializar_db()
 
+# Modelos Pydantic para las peticiones HTTP
 class RegistroSchema(BaseModel):
     usuario: str
     correo: str
@@ -65,7 +68,7 @@ class LoginSchema(BaseModel):
 
 class ActivarPlanSchema(BaseModel):
     usuario: str
-    tipo_plan: str
+    tipo_plan: str  # '1_mes', '3_meses', '12_meses'
 
 class GuardarHistorialSchema(BaseModel):
     usuario: str
@@ -80,6 +83,7 @@ def registrar_usuario(data: RegistroSchema):
     conn = sqlite3.connect("database.db")
     cursor = conn.cursor()
     try:
+        # La cuenta se crea gratis sin fecha de expiración forzosa inicial (o plan 'gratis')
         cursor.execute(
             "INSERT INTO usuarios (usuario, correo, password, plan) VALUES (?, ?, ?, ?)",
             (data.usuario, data.correo, data.password, 'gratis')
@@ -114,6 +118,9 @@ def login_usuario(data: LoginSchema):
         "fecha_expiracion": user[3]
     }
 
+# ==========================================
+# CONTROL DE PAGOS Y PLANES (1 Mes: 12k, 3 Meses: 36k, 12 Meses: 100k)
+# ==========================================
 @app.post("/suscripcion/activar")
 def activar_plan(data: ActivarPlanSchema):
     conn = sqlite3.connect("database.db")
@@ -147,17 +154,24 @@ def activar_plan(data: ActivarPlanSchema):
         "nueva_expiracion": nueva_exp.strftime("%Y-%m-%d")
     }
 
+# ==========================================
+# RUTAS DE HISTORIAL (MÁXIMO LOS ÚLTIMOS 20 PARTIDOS)
+# ==========================================
 @app.post("/historial/guardar")
 def guardar_historial(data: GuardarHistorialSchema):
     conn = sqlite3.connect("database.db")
     cursor = conn.cursor()
     fecha_actual = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     
+    # Guardamos la nueva búsqueda
     cursor.execute(
         "INSERT INTO historial (usuario, fecha, partido_resumen, datos_json) VALUES (?, ?, ?, ?)",
         (data.usuario, fecha_actual, data.partido_resumen, data.datos_json)
     )
     conn.commit()
+    
+    # Opcional para mantener limpia la BD: conservar solo registros recientes si se desea, 
+    # pero el endpoint de lectura ya limita a los últimos 20.
     conn.close()
     return {"mensaje": "Análisis guardado con éxito"}
 
@@ -165,6 +179,7 @@ def guardar_historial(data: GuardarHistorialSchema):
 def ver_historial(usuario: str):
     conn = sqlite3.connect("database.db")
     cursor = conn.cursor()
+    # Limitamos estrictamente a los últimos 20 partidos buscados por el usuario
     cursor.execute("SELECT fecha, partido_resumen, datos_json FROM historial WHERE usuario = ? ORDER BY id DESC LIMIT 20", (usuario,))
     resultados = cursor.fetchall()
     conn.close()
@@ -183,11 +198,6 @@ def _bloque_simulacion(iteraciones, prob_1x2, prob_over_25, prob_over_35, promed
     exitos_1 = exitos_x = exitos_2 = 0
     over_25 = under_25 = over_35 = under_35 = 0
     btts_si_count = btts_no_count = 0
-    
-    # Contadores para nuevos mercados individuales de goles
-    loc_over_05 = loc_under_05 = loc_over_15 = loc_under_15 = 0
-    vis_over_05 = vis_under_05 = vis_over_15 = vis_under_15 = 0
-
     t_over_35 = t_under_35 = t_over_45 = t_under_45 = t_over_55 = t_under_55 = 0
     
     lineas_corners = [7.5, 8.5, 9.5, 10.5]
@@ -227,28 +237,6 @@ def _bloque_simulacion(iteraciones, prob_1x2, prob_over_25, prob_over_35, promed
         else:
             btts_no_count += 1
 
-        # Lógica de goles individuales local
-        if goles_local > 0.5:
-            loc_over_05 += 1
-        else:
-            loc_under_05 += 1
-
-        if goles_local > 1.5:
-            loc_over_15 += 1
-        else:
-            loc_under_15 += 1
-
-        # Lógica de goles individuales visitante
-        if goles_visitante > 0.5:
-            vis_over_05 += 1
-        else:
-            vis_under_05 += 1
-
-        if goles_visitante > 1.5:
-            vis_over_15 += 1
-        else:
-            vis_under_15 += 1
-
         t_val = random.gauss(promedio_tarjetas_arbitro, 1.2) * ritmo
         if random.uniform(0, 100) < p_t35_base * (t_val / promedio_tarjetas_arbitro):
             t_over_35 += 1
@@ -274,8 +262,6 @@ def _bloque_simulacion(iteraciones, prob_1x2, prob_over_25, prob_over_35, promed
 
     return (exitos_1, exitos_x, exitos_2, over_25, under_25, over_35, under_35, 
             btts_si_count, btts_no_count,
-            loc_over_05, loc_under_05, loc_over_15, loc_under_15,
-            vis_over_05, vis_under_05, vis_over_15, vis_under_15,
             t_over_35, t_under_35, t_over_45, t_under_45, t_over_55, t_under_55, 
             corners_counts, corners_under_counts)
 
@@ -349,25 +335,15 @@ def simular_escenarios_con_pinnacle(
     btts_si_tot = sum(r[7] for r in resultados_hilos)
     btts_no_tot = sum(r[8] for r in resultados_hilos)
     
-    loc_o05 = sum(r[9] for r in resultados_hilos)
-    loc_u05 = sum(r[10] for r in resultados_hilos)
-    loc_o15 = sum(r[11] for r in resultados_hilos)
-    loc_u15 = sum(r[12] for r in resultados_hilos)
+    t_over_35 = sum(r[9] for r in resultados_hilos)
+    t_under_35 = sum(r[10] for r in resultados_hilos)
+    t_over_45 = sum(r[11] for r in resultados_hilos)
+    t_under_45 = sum(r[12] for r in resultados_hilos)
+    t_over_55 = sum(r[13] for r in resultados_hilos)
+    t_under_55 = sum(r[14] for r in resultados_hilos)
     
-    vis_o05 = sum(r[13] for r in resultados_hilos)
-    vis_u05 = sum(r[14] for r in resultados_hilos)
-    vis_o15 = sum(r[15] for r in resultados_hilos)
-    vis_u15 = sum(r[16] for r in resultados_hilos)
-
-    t_over_35 = sum(r[17] for r in resultados_hilos)
-    t_under_35 = sum(r[18] for r in resultados_hilos)
-    t_over_45 = sum(r[19] for r in resultados_hilos)
-    t_under_45 = sum(r[20] for r in resultados_hilos)
-    t_over_55 = sum(r[21] for r in resultados_hilos)
-    t_under_55 = sum(r[22] for r in resultados_hilos)
-    
-    corners_counts = {k: sum(r[23][k] for r in resultados_hilos) for k in [7.5, 8.5, 9.5, 10.5]}
-    corners_under_counts = {k: sum(r[24][k] for r in resultados_hilos) for k in [7.5, 8.5, 9.5, 10.5]}
+    corners_counts = {k: sum(r[15][k] for r in resultados_hilos) for k in [7.5, 8.5, 9.5, 10.5]}
+    corners_under_counts = {k: sum(r[16][k] for r in resultados_hilos) for k in [7.5, 8.5, 9.5, 10.5]}
 
     n = float(total_escenarios)
     return {
@@ -380,14 +356,6 @@ def simular_escenarios_con_pinnacle(
         "under_35": round((under_35_goles / n) * 100.0, 1),
         "btts_si": round((btts_si_tot / n) * 100.0, 1),
         "btts_no": round((btts_no_tot / n) * 100.0, 1),
-        "loc_over_05": round((loc_o05 / n) * 100.0, 1),
-        "loc_under_05": round((loc_u05 / n) * 100.0, 1),
-        "loc_over_15": round((loc_o15 / n) * 100.0, 1),
-        "loc_under_15": round((loc_u15 / n) * 100.0, 1),
-        "vis_over_05": round((vis_o05 / n) * 100.0, 1),
-        "vis_under_05": round((vis_u05 / n) * 100.0, 1),
-        "vis_over_15": round((vis_o15 / n) * 100.0, 1),
-        "vis_under_15": round((vis_u15 / n) * 100.0, 1),
         "tarjetas_mas_35": round((t_over_35 / n) * 100.0, 1),
         "tarjetas_menos_35": round((t_under_35 / n) * 100.0, 1),
         "tarjetas_mas_45": round((t_over_45 / n) * 100.0, 1),
@@ -402,7 +370,7 @@ def simular_escenarios_con_pinnacle(
 def home():
     return {"mensaje": "API Master Pro - Motor Estocástico con Base de Datos e Historial Activo"}
 
-# --- RUTA 1: FASE SUPERIOR (GRATUITA) CON GOLES INDIVIDUALES Y TOP 3 ---
+# --- RUTA 1: FASE SUPERIOR ---
 @app.get("/analisis/partido")
 def analizar_partido(
     cuota_local: float = 3.03,
@@ -420,7 +388,6 @@ def analizar_partido(
             cuota_mas_35_goles, cuota_menos_35_goles
         )
         
-        # Recopilamos todos los candidatos incluyendo los nuevos mercados individuales de goles
         candidatos_top = [
             {"prob": sim['p_1'], "texto": f"Victoria Local (1): {sim['p_1']}%"},
             {"prob": sim['p_x'], "texto": f"Empate Técnico (X): {sim['p_x']}%"},
@@ -430,23 +397,13 @@ def analizar_partido(
             {"prob": sim['over_35'], "texto": f"Más de 3.5 Goles: {sim['over_35']}%"},
             {"prob": sim['under_35'], "texto": f"Menos de 3.5 Goles: {sim['under_35']}%"},
             {"prob": sim['btts_si'], "texto": f"Ambos Anotan (Sí): {sim['btts_si']}%"},
-            {"prob": sim['btts_no'], "texto": f"Ambos Anotan (No): {sim['btts_no']}%"},
-            {"prob": sim['loc_over_05'], "texto": f"Más de 0.5 Goles (Local): {sim['loc_over_05']}%"},
-            {"prob": sim['loc_under_05'], "texto": f"Menos de 0.5 Goles (Local): {sim['loc_under_05']}%"},
-            {"prob": sim['loc_over_15'], "texto": f"Más de 1.5 Goles (Local): {sim['loc_over_15']}%"},
-            {"prob": sim['loc_under_15'], "texto": f"Menos de 1.5 Goles (Local): {sim['loc_under_15']}%"},
-            {"prob": sim['vis_over_05'], "texto": f"Más de 0.5 Goles (Visitante): {sim['vis_over_05']}%"},
-            {"prob": sim['vis_under_05'], "texto": f"Menos de 0.5 Goles (Visitante): {sim['vis_under_05']}%"},
-            {"prob": sim['vis_over_15'], "texto": f"Más de 1.5 Goles (Visitante): {sim['vis_over_15']}%"},
-            {"prob": sim['vis_under_15'], "texto": f"Menos de 1.5 Goles (Visitante): {sim['vis_under_15']}%"}
+            {"prob": sim['btts_no'], "texto": f"Ambos Anotan (No): {sim['btts_no']}%"}
         ]
-        
-        # Ordenar de mayor a menor probabilidad para obtener el Top 3 real
         candidatos_top.sort(key=lambda x: x["prob"], reverse=True)
 
         return {
             "aviso_legal_licencia": "NOTA: Análisis matemático estocástico avanzado de 50,000 iteraciones.",
-            "origen": "Fase 1 - 1X2, Goles, Goles Individuales y BTTS (Pinnacle)",
+            "origen": "Fase 1 - 1X2, Goles y BTTS (Pinnacle)",
             "probabilidades_1x2_simuladas": {
                 "local": f"{sim['p_1']}%",
                 "empate": f"{sim['p_x']}%",
@@ -460,20 +417,6 @@ def analizar_partido(
                 "btts_si": f"{sim['btts_si']}%",
                 "btts_no": f"{sim['btts_no']}%"
             },
-            "goles_individuales": {
-                "local": {
-                    "mas_de_0.5": f"{sim['loc_over_05']}%",
-                    "menos_de_0.5": f"{sim['loc_under_05']}%",
-                    "mas_de_1.5": f"{sim['loc_over_15']}%",
-                    "menos_de_1.5": f"{sim['loc_under_15']}%"
-                },
-                "visitante": {
-                    "mas_de_0.5": f"{sim['vis_over_05']}%",
-                    "menos_de_0.5": f"{sim['vis_under_05']}%",
-                    "mas_de_1.5": f"{sim['vis_over_15']}%",
-                    "menos_de_1.5": f"{sim['vis_under_15']}%"
-                }
-            },
             "top_3_recomendaciones": [
                 candidatos_top[0]['texto'],
                 candidatos_top[1]['texto'],
@@ -484,7 +427,7 @@ def analizar_partido(
     except Exception as e:
         return {"error": f"Error en el servidor: {str(e)}"}
 
-# --- RUTA 2: JACKBUSCA (INTACTA: TARJETAS Y CÓRNERS) ---
+# --- RUTA 2: JACKBUSCA ---
 @app.get("/jackbusca/partido")
 def jackbusca_partido(
     cuota_local: float = 3.03,
