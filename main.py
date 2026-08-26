@@ -19,7 +19,7 @@ from fastapi import Request
 app = FastAPI(
     title="API Master Pro - Pinnacle Optimized Edition",
     description="Motor de simulación matemática avanzada de 50,000 escenarios con base de datos e historial",
-    version="8.6.0"
+    version="8.7.0"
 )
 
 # ==========================================
@@ -28,6 +28,10 @@ app = FastAPI(
 FREE_HISTORY_LIMIT = 10
 PREMIUM_HISTORY_LIMIT = 100
 SESSION_DAYS = 7
+EMAIL_VERIFICATION_DAYS = int(os.getenv("EMAIL_VERIFICATION_DAYS", "1"))
+PASSWORD_RESET_MINUTES = int(os.getenv("PASSWORD_RESET_MINUTES", "30"))
+APP_BASE_URL = os.getenv("APP_BASE_URL", "https://api-futbol-pro.onrender.com")
+DEV_SHOW_EMAIL_TOKENS = os.getenv("DEV_SHOW_EMAIL_TOKENS", "0") == "1"
 ADMIN_EMAIL = os.getenv("API_MASTER_ADMIN_EMAIL", "")
 ADMIN_PASSWORD = os.getenv("API_MASTER_ADMIN_PASSWORD", "")
 WOMPI_PUBLIC_KEY = os.getenv("WOMPI_PUBLIC_KEY", "")
@@ -62,6 +66,52 @@ def _password_verify(password: str, stored: str) -> bool:
 
 def _new_session() -> str:
     return secrets.token_urlsafe(48)
+
+def _token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
+def _valid_email(email: str) -> bool:
+    import re
+    return bool(re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email.strip()))
+
+def _create_email_token(user_id: int, purpose: str, minutes: int) -> str:
+    raw = secrets.token_urlsafe(48)
+    now = datetime.now()
+    exp = now + timedelta(minutes=minutes)
+    conn = _db()
+    conn.execute("DELETE FROM email_tokens WHERE usuario_id=? AND purpose=?", (user_id, purpose))
+    conn.execute("INSERT INTO email_tokens(token_hash,usuario_id,purpose,creado_en,expires_at,used) VALUES(?,?,?,?,?,0)",
+                 (_token_hash(raw), user_id, purpose, now.isoformat(), exp.isoformat()))
+    conn.commit(); conn.close()
+    return raw
+
+def _consume_email_token(raw: str, purpose: str):
+    if not raw:
+        return None
+    conn = _db()
+    row = conn.execute("SELECT id,usuario_id,expires_at,used FROM email_tokens WHERE token_hash=? AND purpose=?",
+                       (_token_hash(raw), purpose)).fetchone()
+    if not row:
+        conn.close(); return None
+    try:
+        expired = datetime.fromisoformat(row["expires_at"]) <= datetime.now()
+    except Exception:
+        expired = True
+    if row["used"] or expired:
+        conn.close(); return None
+    conn.execute("UPDATE email_tokens SET used=1 WHERE id=?", (row["id"],))
+    conn.commit(); conn.close()
+    return row["usuario_id"]
+
+def _send_verification_email(email: str, usuario: str, token: str):
+    link = APP_BASE_URL.rstrip('/') + '/?verify_email=' + token
+    return _send_email(email, 'API Master Pro: verifica tu correo',
+                       f"Hola {usuario},\n\nConfirma tu correo para activar tu cuenta en API Master Pro:\n\n{link}\n\nEste enlace vence en {EMAIL_VERIFICATION_DAYS} día(s). Si no creaste esta cuenta, ignora este mensaje.")
+
+def _send_reset_email(email: str, usuario: str, token: str):
+    link = APP_BASE_URL.rstrip('/') + '/?reset_password=' + token
+    return _send_email(email, 'API Master Pro: recuperación de contraseña',
+                       f"Hola {usuario},\n\nRecibimos una solicitud para cambiar tu contraseña. Usa este enlace:\n\n{link}\n\nEl enlace vence en {PASSWORD_RESET_MINUTES} minutos. Si no solicitaste el cambio, ignora este mensaje.")
 
 def _db():
     conn = sqlite3.connect("database.db")
@@ -120,7 +170,7 @@ def _get_user_from_token(token: str):
     if not token:
         return None
     conn = _db()
-    row = conn.execute("SELECT u.id,u.usuario,u.correo,u.plan,u.fecha_expiracion,s.expires_at FROM sesiones s JOIN usuarios u ON u.id=s.usuario_id WHERE s.token=?", (token,)).fetchone()
+    row = conn.execute("SELECT u.id,u.usuario,u.correo,u.plan,u.fecha_expiracion,u.email_verificado,s.expires_at FROM sesiones s JOIN usuarios u ON u.id=s.usuario_id WHERE s.token=?", (token,)).fetchone()
     if not row:
         conn.close(); return None
     try:
@@ -139,7 +189,7 @@ def _get_user_from_token(token: str):
         except Exception: plan=row["plan"]
     else: plan=row["plan"]
     conn.close()
-    return {"id": row["id"], "usuario": row["usuario"], "correo": row["correo"], "plan": plan, "fecha_expiracion": row["fecha_expiracion"]}
+    return {"id": row["id"], "usuario": row["usuario"], "correo": row["correo"], "plan": plan, "fecha_expiracion": row["fecha_expiracion"], "email_verificado": bool(row["email_verificado"])}
 
 def _optional_user(request: Request):
     auth = request.headers.get("Authorization", "")
@@ -204,9 +254,16 @@ def inicializar_db():
             password TEXT NOT NULL,
             plan TEXT DEFAULT 'gratis',
             fecha_expiracion TEXT,
-            activo INTEGER DEFAULT 1
+            activo INTEGER DEFAULT 1,
+            email_verificado INTEGER DEFAULT 0
         )
     """)
+    # Migración segura para instalaciones v8.6 existentes.
+    cols = [r[1] for r in cursor.execute("PRAGMA table_info(usuarios)").fetchall()]
+    if 'email_verificado' not in cols:
+        cursor.execute("ALTER TABLE usuarios ADD COLUMN email_verificado INTEGER DEFAULT 0")
+        # Las cuentas existentes no pierden acceso; las nuevas sí requieren verificación.
+        cursor.execute("UPDATE usuarios SET email_verificado=1 WHERE email_verificado IS NULL OR email_verificado=0")
     
     # Tabla de Historial de Análisis
     cursor.execute("""
@@ -219,6 +276,7 @@ def inicializar_db():
         )
     """)
     cursor.execute("CREATE TABLE IF NOT EXISTS sesiones (token TEXT PRIMARY KEY, usuario_id INTEGER NOT NULL, creado_en TEXT NOT NULL, expires_at TEXT NOT NULL, FOREIGN KEY(usuario_id) REFERENCES usuarios(id))")
+    cursor.execute("""CREATE TABLE IF NOT EXISTS email_tokens (id INTEGER PRIMARY KEY AUTOINCREMENT, token_hash TEXT UNIQUE NOT NULL, usuario_id INTEGER NOT NULL, purpose TEXT NOT NULL, creado_en TEXT NOT NULL, expires_at TEXT NOT NULL, used INTEGER DEFAULT 0, FOREIGN KEY(usuario_id) REFERENCES usuarios(id))""")
     cursor.execute("""CREATE TABLE IF NOT EXISTS pagos (
         id INTEGER PRIMARY KEY AUTOINCREMENT, referencia TEXT UNIQUE NOT NULL, usuario TEXT NOT NULL, plan TEXT NOT NULL,
         monto INTEGER NOT NULL, moneda TEXT NOT NULL DEFAULT 'COP', estado TEXT NOT NULL DEFAULT 'PENDING',
@@ -239,6 +297,13 @@ class LoginSchema(BaseModel):
     usuario: str
     password: str
 
+class EmailSchema(BaseModel):
+    correo: str
+
+class ResetPasswordSchema(BaseModel):
+    token: str
+    password: str
+
 class ActivarPlanSchema(BaseModel):
     usuario: str
     tipo_plan: str  # '1_mes', '3_meses', '12_meses'
@@ -255,28 +320,108 @@ class GuardarHistorialSchema(BaseModel):
 def registrar_usuario(data: RegistroSchema):
     if len(data.password) < 8:
         raise HTTPException(status_code=400, detail="La contraseña debe tener al menos 8 caracteres.")
+    email = data.correo.strip().lower()
+    usuario = data.usuario.strip()
+    if not usuario or len(usuario) < 3:
+        raise HTTPException(status_code=400, detail="El usuario debe tener al menos 3 caracteres.")
+    if not _valid_email(email):
+        raise HTTPException(status_code=400, detail="Ingresa un correo electrónico válido.")
     conn = _db()
     try:
-        conn.execute("INSERT INTO usuarios (usuario, correo, password, plan) VALUES (?, ?, ?, ?)", (data.usuario.strip(), data.correo.strip().lower(), _password_hash(data.password), 'gratis'))
+        conn.execute("INSERT INTO usuarios (usuario, correo, password, plan, email_verificado) VALUES (?, ?, ?, ?, 0)",
+                     (usuario, email, _password_hash(data.password), 'gratis'))
         conn.commit()
-        return {"mensaje": "Cuenta creada con éxito.", "usuario": data.usuario.strip(), "correo": data.correo.strip().lower(), "plan": "gratis"}
+        row = conn.execute("SELECT id FROM usuarios WHERE usuario=?", (usuario,)).fetchone()
     except sqlite3.IntegrityError:
         raise HTTPException(status_code=400, detail="El nombre de usuario o el correo ya están registrados.")
     finally:
         conn.close()
+    token = _create_email_token(row["id"], "verify_email", EMAIL_VERIFICATION_DAYS * 24 * 60)
+    sent = False
+    try:
+        sent = _send_verification_email(email, usuario, token)
+    except Exception:
+        sent = False
+    response = {"mensaje":"Cuenta creada. Revisa tu correo para verificarla.", "usuario":usuario, "correo":email, "plan":"gratis", "email_verificado":False, "correo_enviado":sent}
+    if DEV_SHOW_EMAIL_TOKENS and not sent:
+        response["dev_verification_link"] = APP_BASE_URL.rstrip('/') + '/?verify_email=' + token
+    return response
+
+@app.get("/auth/verify-email")
+def verificar_correo(token: str):
+    user_id = _consume_email_token(token, "verify_email")
+    if not user_id:
+        raise HTTPException(status_code=400, detail="El enlace no existe, ya fue utilizado o expiró.")
+    conn = _db()
+    conn.execute("UPDATE usuarios SET email_verificado=1 WHERE id=?", (user_id,))
+    row = conn.execute("SELECT usuario,correo FROM usuarios WHERE id=?", (user_id,)).fetchone()
+    conn.commit(); conn.close()
+    return {"mensaje":"Correo verificado correctamente. Ya puedes iniciar sesión.", "usuario":row["usuario"], "correo":row["correo"]}
+
+@app.post("/auth/resend-verification")
+def reenviar_verificacion(data: EmailSchema):
+    email = data.correo.strip().lower()
+    conn = _db()
+    row = conn.execute("SELECT id,usuario,email_verificado FROM usuarios WHERE correo=?", (email,)).fetchone()
+    conn.close()
+    # Respuesta neutra para no revelar si un correo está registrado.
+    response = {"mensaje":"Si la cuenta existe y aún no está verificada, recibirás un nuevo enlace."}
+    if not row or row["email_verificado"]:
+        return response
+    token = _create_email_token(row["id"], "verify_email", EMAIL_VERIFICATION_DAYS * 24 * 60)
+    try:
+        sent = _send_verification_email(email, row["usuario"], token)
+    except Exception:
+        sent = False
+    if DEV_SHOW_EMAIL_TOKENS and not sent:
+        response["dev_verification_link"] = APP_BASE_URL.rstrip('/') + '/?verify_email=' + token
+    return response
+
+@app.post("/auth/forgot-password")
+def solicitar_recuperacion(data: EmailSchema):
+    email = data.correo.strip().lower()
+    conn = _db()
+    row = conn.execute("SELECT id,usuario FROM usuarios WHERE correo=?", (email,)).fetchone()
+    conn.close()
+    response = {"mensaje":"Si existe una cuenta con ese correo, recibirás instrucciones para recuperar la contraseña."}
+    if not row:
+        return response
+    token = _create_email_token(row["id"], "reset_password", PASSWORD_RESET_MINUTES)
+    try:
+        sent = _send_reset_email(email, row["usuario"], token)
+    except Exception:
+        sent = False
+    if DEV_SHOW_EMAIL_TOKENS and not sent:
+        response["dev_reset_link"] = APP_BASE_URL.rstrip('/') + '/?reset_password=' + token
+    return response
+
+@app.post("/auth/reset-password")
+def resetear_password(data: ResetPasswordSchema):
+    if len(data.password) < 8:
+        raise HTTPException(status_code=400, detail="La nueva contraseña debe tener al menos 8 caracteres.")
+    user_id = _consume_email_token(data.token, "reset_password")
+    if not user_id:
+        raise HTTPException(status_code=400, detail="El enlace de recuperación no existe, ya fue utilizado o expiró.")
+    conn = _db()
+    conn.execute("UPDATE usuarios SET password=?, email_verificado=1 WHERE id=?", (_password_hash(data.password), user_id))
+    conn.execute("DELETE FROM sesiones WHERE usuario_id=?", (user_id,))
+    conn.commit(); conn.close()
+    return {"mensaje":"Contraseña actualizada. Inicia sesión nuevamente."}
 
 @app.post("/auth/login")
 def login_usuario(data: LoginSchema):
     conn = _db()
-    row = conn.execute("SELECT id, usuario, correo, password, plan, fecha_expiracion FROM usuarios WHERE usuario = ?", (data.usuario.strip(),)).fetchone()
+    row = conn.execute("SELECT id, usuario, correo, password, plan, fecha_expiracion, email_verificado FROM usuarios WHERE usuario = ?", (data.usuario.strip(),)).fetchone()
     if not row or not _password_verify(data.password, row["password"]):
         conn.close(); raise HTTPException(status_code=401, detail="Usuario o contraseña incorrectos.")
+    if not row["email_verificado"]:
+        conn.close(); raise HTTPException(status_code=403, detail="Debes verificar tu correo antes de iniciar sesión.")
     if not row["password"].startswith("pbkdf2$"):
         conn.execute("UPDATE usuarios SET password=? WHERE id=?", (_password_hash(data.password), row["id"]))
     token = _new_session(); now=datetime.now(); exp=now+timedelta(days=SESSION_DAYS)
     conn.execute("INSERT INTO sesiones(token,usuario_id,creado_en,expires_at) VALUES(?,?,?,?)", (token,row["id"],now.isoformat(),exp.isoformat()))
     conn.commit(); conn.close()
-    return {"mensaje":"Login exitoso","token":token,"usuario":row["usuario"],"correo":row["correo"],"plan":row["plan"],"fecha_expiracion":row["fecha_expiracion"]}
+    return {"mensaje":"Login exitoso","token":token,"usuario":row["usuario"],"correo":row["correo"],"plan":row["plan"],"fecha_expiracion":row["fecha_expiracion"],"email_verificado":True}
 
 @app.post("/auth/logout")
 def logout_usuario(request: Request):
