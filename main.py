@@ -9,6 +9,7 @@ app = FastAPI(
     version="5.3.0"
 )
 
+# Configuración de CORS para permitir conexiones desde Vercel o cualquier origen
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -17,12 +18,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Función auxiliar que corre un bloque de simulaciones en paralelo
 def _bloque_simulacion(iteraciones, prob_1x2, prob_over_25, prob_over_35, promedio_tarjetas_arbitro, p_t35_base, p_t45_base, p_t55_base, corners_bases):
     p_l, p_e, p_v = prob_1x2
     exitos_1 = exitos_x = exitos_2 = 0
     over_25 = under_25 = over_35 = under_35 = 0
     btts_si_count = btts_no_count = 0
-    
     t_over_35 = t_under_35 = t_over_45 = t_under_45 = t_over_55 = t_under_55 = 0
     
     lineas_corners = [7.5, 8.5, 9.5, 10.5]
@@ -32,7 +33,7 @@ def _bloque_simulacion(iteraciones, prob_1x2, prob_over_25, prob_over_35, promed
     for _ in range(iteraciones):
         ritmo = random.gauss(1.0, 0.14)
         
-        # 1. Simulación del 1X2 y asignación de goles esperados aproximados por equipo según el resultado
+        # 1. Simulación del 1X2 y asignación de goles esperados por equipo
         dado_1x2 = random.uniform(0, 100)
         if dado_1x2 < p_l:
             exitos_1 += 1
@@ -41,13 +42,13 @@ def _bloque_simulacion(iteraciones, prob_1x2, prob_over_25, prob_over_35, promed
         elif dado_1x2 < (p_l + p_e):
             exitos_x += 1
             goles_local = random.choice([0, 1, 2])
-            goles_visitante = goles_local # Empate
+            goles_visitante = goles_local
         else:
             exitos_2 += 1
             goles_local = random.choice([0, 1, 2])
             goles_visitante = random.choice([1, 2, 3, 4])
 
-        # 2. Goles totales y BTTS basados en el desarrollo estocástico
+        # 2. Goles totales y BTTS (NUEVO CALCULO)
         total_goles = goles_local + goles_visitante
         if total_goles > 2.5:
             over_25 += 1
@@ -65,7 +66,7 @@ def _bloque_simulacion(iteraciones, prob_1x2, prob_over_25, prob_over_35, promed
         else:
             btts_no_count += 1
 
-        # 3. Tarjetas
+        # Tarjetas
         t_val = random.gauss(promedio_tarjetas_arbitro, 1.2) * ritmo
         if random.uniform(0, 100) < p_t35_base * (t_val / promedio_tarjetas_arbitro):
             t_over_35 += 1
@@ -82,7 +83,7 @@ def _bloque_simulacion(iteraciones, prob_1x2, prob_over_25, prob_over_35, promed
         else:
             t_under_55 += 1
 
-        # 4. Córners
+        # Córners
         c_val = random.gauss(9.5, 2.2) * ritmo
         for linea in lineas_corners:
             if random.uniform(0, 100) < corners_bases[linea] * (c_val / 9.5):
@@ -109,6 +110,7 @@ def simular_escenarios_con_pinnacle(
     c_c_mas_105: float = 2.40, c_c_menos_105: float = 1.55
 ) -> dict:
     
+    # 1. Normalización de probabilidades implícitas puras de 1X2 (quitando el vig de Pinnacle)
     p_l_bruta = 1.0 / cuota_local
     p_e_bruta = 1.0 / cuota_empate
     p_v_bruta = 1.0 / cuota_visitante
@@ -118,18 +120,22 @@ def simular_escenarios_con_pinnacle(
     p_empate_real = (p_e_bruta / suma_1x2) * 100.0
     p_visitante_real = (p_v_bruta / suma_1x2) * 100.0
 
+    # Función auxiliar para calcular probabilidades puras a partir de cuotas Over/Under
     def get_prob_over(c_o, c_u):
         po = 1.0 / c_o
         pu = 1.0 / c_u
         return (po / (po + pu)) * 100.0
 
+    # Probabilidades puras para Goles
     prob_over_25_base = get_prob_over(cuota_mas_25, cuota_menos_25)
     prob_over_35_base = get_prob_over(cuota_mas_35, cuota_menos_35)
 
+    # Probabilidades puras para Tarjetas
     p_t35_base = get_prob_over(c_t_mas_35, c_t_menos_35)
     p_t45_base = get_prob_over(c_t_mas_45, c_t_menos_45)
     p_t55_base = get_prob_over(c_t_mas_55, c_t_menos_55)
 
+    # Probabilidades puras para Córners
     corners_bases = {
         7.5: get_prob_over(c_c_mas_75, c_c_menos_75),
         8.5: get_prob_over(c_c_mas_85, c_c_menos_85),
@@ -137,6 +143,7 @@ def simular_escenarios_con_pinnacle(
         10.5: get_prob_over(c_c_mas_105, c_c_menos_105)
     }
 
+    # 2. Simulación estocástica paralela de 50,000 escenarios dividida en 4 hilos (aprovechando el i7)
     total_escenarios = 50000
     hilos = 4
     bloque = total_escenarios // hilos
@@ -155,6 +162,7 @@ def simular_escenarios_con_pinnacle(
         for f in futures:
             resultados_hilos.append(f.result())
 
+    # Consolidar resultados
     exitos_1 = sum(r[0] for r in resultados_hilos)
     exitos_x = sum(r[1] for r in resultados_hilos)
     exitos_2 = sum(r[2] for r in resultados_hilos)
@@ -198,8 +206,9 @@ def simular_escenarios_con_pinnacle(
 
 @app.get("/")
 def home():
-    return {"mensaje": "API Master Pro - Motor Estocástico con BTTS Real"}
+    return {"mensaje": "API Master Pro - Motor Estocástico de 50,000 Escenarios con Cuotas Manuales de Pinnacle"}
 
+# --- RUTA 1: FASE SUPERIOR (Local, Empate, Visitante y Goles con cuotas Pinnacle) ---
 @app.get("/analisis/partido")
 def analizar_partido(
     cuota_local: float = 3.03,
@@ -217,7 +226,6 @@ def analizar_partido(
             cuota_mas_35_goles, cuota_menos_35_goles
         )
         
-        # Criterio autónomo: La bolsa de candidatos compite de verdad por porcentaje matemático
         candidatos_top = [
             {"prob": sim['p_1'], "texto": f"Victoria Local (1): {sim['p_1']}%"},
             {"prob": sim['p_x'], "texto": f"Empate Técnico (X): {sim['p_x']}%"},
@@ -229,7 +237,6 @@ def analizar_partido(
             {"prob": sim['btts_si'], "texto": f"Ambos Anotan (Sí): {sim['btts_si']}%"},
             {"prob": sim['btts_no'], "texto": f"Ambos Anotan (No): {sim['btts_no']}%"}
         ]
-        # Ordenar de mayor a menor probabilidad real de las 50k simulaciones
         candidatos_top.sort(key=lambda x: x["prob"], reverse=True)
 
         return {
@@ -254,6 +261,80 @@ def analizar_partido(
                 candidatos_top[2]['texto']
             ],
             "estado": "Simulación de Fase 1 completada con éxito (50k escenarios)"
+        }
+    except Exception as e:
+        return {"error": f"Error en el servidor: {str(e)}"}
+
+
+# --- RUTA 2: JACKBUSCA (Tarjetas, Promedio Árbitro y Tiros de Esquina con cuotas Pinnacle) ---
+@app.get("/jackbusca/partido")
+def jackbusca_partido(
+    cuota_local: float = 3.03,
+    cuota_empate: float = 3.26,
+    cuota_visitante: float = 2.56,
+    cuota_mas_25_goles: float = 1.95,
+    cuota_menos_25_goles: float = 1.85,
+    cuota_mas_35_goles: float = 3.40,
+    cuota_menos_35_goles: float = 1.32,
+    promedio_tarjetas_arbitro: float = 4.5,
+    cuota_tarjetas_mas_35: float = 1.80,
+    cuota_tarjetas_menos_35: float = 2.00,
+    cuota_tarjetas_mas_45: float = 2.50,
+    cuota_tarjetas_menos_45: float = 1.50,
+    cuota_tarjetas_mas_55: float = 3.50,
+    cuota_tarjetas_menos_55: float = 1.25,
+    cuota_corners_mas_75: float = 1.20,
+    cuota_corners_mas_85: float = 1.45,
+    cuota_corners_mas_95: float = 1.85,
+    cuota_corners_mas_105: float = 2.40,
+    cuota_corners_menos_75: float = 4.00,
+    cuota_corners_menos_85: float = 2.60,
+    cuota_corners_menos_95: float = 1.90,
+    cuota_corners_menos_105: float = 1.55
+):
+    try:
+        sim = simular_escenarios_con_pinnacle(
+            cuota_local, cuota_empate, cuota_visitante,
+            cuota_mas_25_goles, cuota_menos_25_goles,
+            cuota_mas_35_goles, cuota_menos_35_goles,
+            promedio_tarjetas_arbitro,
+            cuota_tarjetas_mas_35, cuota_tarjetas_menos_35,
+            cuota_tarjetas_mas_45, cuota_tarjetas_menos_45,
+            cuota_tarjetas_mas_55, cuota_tarjetas_menos_55,
+            cuota_corners_mas_75, cuota_corners_menos_75,
+            cuota_corners_mas_85, cuota_corners_menos_85,
+            cuota_corners_mas_95, cuota_corners_menos_95,
+            cuota_corners_mas_105, cuota_corners_menos_105
+        )
+        
+        return {
+            "origen": "JackBusca Fase 2 - Tarjetas y Córners (Motor Estocástico Pinnacle 50k)",
+            "arbitraje": {
+                "promedio_tarjetas_referencia": promedio_tarjetas_arbitro
+            },
+            "mercados_tarjetas_explicados": {
+                "mas_de_3.5_tarjetas": f"{sim['tarjetas_mas_35']}%",
+                "menos_de_3.5_tarjetas": f"{sim['tarjetas_menos_35']}%",
+                "mas_de_4.5_tarjetas": f"{sim['tarjetas_mas_45']}%",
+                "menos_de_4.5_tarjetas": f"{sim['tarjetas_menos_45']}%",
+                "mas_de_5.5_tarjetas": f"{sim['tarjetas_mas_55']}%",
+                "menos_de_5.5_tarjetas": f"{sim['tarjetas_menos_55']}%"
+            },
+            "mercados_tiros_de_esquina": {
+                "mas_de": {
+                    "7.5": f"{sim['corners_mas'][7.5]}%",
+                    "8.5": f"{sim['corners_mas'][8.5]}%",
+                    "9.5": f"{sim['corners_mas'][9.5]}%",
+                    "10.5": f"{sim['corners_mas'][10.5]}%"
+                },
+                "menos_de": {
+                    "7.5": f"{sim['corners_menos'][7.5]}%",
+                    "8.5": f"{sim['corners_menos'][8.5]}%",
+                    "9.5": f"{sim['corners_menos'][9.5]}%",
+                    "10.5": f"{sim['corners_menos'][10.5]}%"
+                }
+            },
+            "estado": "JackBusca procesó los mercados secundarios con éxito (50k escenarios)"
         }
     except Exception as e:
         return {"error": f"Error en el servidor: {str(e)}"}
