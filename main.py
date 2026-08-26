@@ -2,6 +2,8 @@ from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import random
+import math
+import bisect
 from concurrent.futures import ThreadPoolExecutor
 import sqlite3
 from datetime import datetime, timedelta
@@ -9,7 +11,7 @@ from datetime import datetime, timedelta
 app = FastAPI(
     title="API Master Pro - Pinnacle Optimized Edition",
     description="Motor de simulación matemática avanzada de 50,000 escenarios con base de datos e historial",
-    version="8.0.0"
+    version="8.1.0"
 )
 
 # Configuración de CORS
@@ -193,41 +195,190 @@ def ver_historial(usuario: str):
 # ==========================================
 # MOTOR DE SIMULACIÓN ESTOCÁSTICA (50k ESCENARIOS)
 # ==========================================
-def _bloque_simulacion(iteraciones, prob_1x2, prob_over_25, prob_over_35, promedio_tarjetas_arbitro, p_t35_base, p_t45_base, p_t55_base, corners_bases):
-    p_l, p_e, p_v = prob_1x2
+#
+# V8.1 - Corrección del modelo de goles y ranking:
+# 1) Las cuotas 1X2 + Over/Under calibran un modelo de goles Poisson.
+# 2) BTTS NO se usa para fabricar los goles; se usa como mercado independiente
+#    para validar la predicción derivada de 1X2 + líneas de goles.
+# 3) Las 50.000 simulaciones se mantienen.
+# 4) El Top 3 ya no es simplemente "los tres porcentajes más altos":
+#    considera probabilidad, edge frente a Pinnacle y penalización por contradicción.
+# ==========================================
+
+def _probabilidades_poisson(lambda_local, lambda_visitante, max_goles=8):
+    """Construye probabilidades de marcadores 0..max_goles x 0..max_goles."""
+    def poisson_probs(lam):
+        probs = [math.exp(-lam)]
+        for k in range(1, max_goles + 1):
+            probs.append(probs[-1] * lam / k)
+        resto = max(0.0, 1.0 - sum(probs))
+        probs[-1] += resto
+        return probs
+
+    pl = poisson_probs(lambda_local)
+    pv = poisson_probs(lambda_visitante)
+    resultados = []
+    for gl, pgl in enumerate(pl):
+        for gv, pgv in enumerate(pv):
+            resultados.append((gl, gv, pgl * pgv))
+
+    total = sum(x[2] for x in resultados)
+    return [(gl, gv, p / total) for gl, gv, p in resultados]
+
+
+def _metricas_modelo(lambda_local, lambda_visitante):
+    """Probabilidades analíticas del modelo, sin necesidad de simular."""
+    dist = _probabilidades_poisson(lambda_local, lambda_visitante)
+    p1 = px = p2 = over25 = over35 = btts = 0.0
+    for gl, gv, p in dist:
+        if gl > gv:
+            p1 += p
+        elif gl == gv:
+            px += p
+        else:
+            p2 += p
+        if gl + gv >= 3:
+            over25 += p
+        if gl + gv >= 4:
+            over35 += p
+        if gl > 0 and gv > 0:
+            btts += p
+    return {
+        "p_1": p1 * 100.0,
+        "p_x": px * 100.0,
+        "p_2": p2 * 100.0,
+        "over_25": over25 * 100.0,
+        "under_25": (1.0 - over25) * 100.0,
+        "over_35": over35 * 100.0,
+        "under_35": (1.0 - over35) * 100.0,
+        "btts_si": btts * 100.0,
+        "btts_no": (1.0 - btts) * 100.0,
+    }
+
+
+def _ajustar_probabilidades_cuota(c1, c2):
+    """Convierte dos cuotas del mismo mercado en probabilidades sin margen."""
+    if c1 <= 1.0 or c2 <= 1.0:
+        raise ValueError("Las cuotas deben ser mayores que 1.00")
+    p1 = 1.0 / c1
+    p2 = 1.0 / c2
+    total = p1 + p2
+    return p1 / total, p2 / total
+
+
+def _ajustar_1x2(c_local, c_empate, c_visitante):
+    if min(c_local, c_empate, c_visitante) <= 1.0:
+        raise ValueError("Las cuotas 1X2 deben ser mayores que 1.00")
+    bruto = [1.0 / c_local, 1.0 / c_empate, 1.0 / c_visitante]
+    total = sum(bruto)
+    return tuple(x / total for x in bruto)
+
+
+def _ajuste_poisson_objetivo(lh, lv, objetivo_1x2, objetivo_over25, objetivo_over35):
+    m = _metricas_modelo(lh, lv)
+    error_1x2 = sum((a - b) ** 2 for a, b in zip(
+        (m["p_1"] / 100.0, m["p_x"] / 100.0, m["p_2"] / 100.0), objetivo_1x2
+    ))
+    error_goles = (
+        1.35 * ((m["over_25"] / 100.0) - objetivo_over25) ** 2 +
+        1.00 * ((m["over_35"] / 100.0) - objetivo_over35) ** 2
+    )
+    return error_1x2 + error_goles
+
+
+def _calibrar_lambdas(cuota_local, cuota_empate, cuota_visitante,
+                      cuota_mas_25, cuota_menos_25,
+                      cuota_mas_35, cuota_menos_35):
+    """Estima goles esperados local/visitante usando mercados distintos de BTTS.
+
+    Esto es deliberado: BTTS queda como mercado de validación independiente.
+    Así evitamos que el propio BTTS obligue al motor a elegir BTTS Sí.
+    """
+    objetivo_1x2 = _ajustar_1x2(cuota_local, cuota_empate, cuota_visitante)
+    objetivo_o25, _ = _ajustar_probabilidades_cuota(cuota_mas_25, cuota_menos_25)
+    objetivo_o35, _ = _ajustar_probabilidades_cuota(cuota_mas_35, cuota_menos_35)
+
+    mejor = (float("inf"), 1.35, 1.05)
+
+    # Primera pasada: búsqueda estable y rápida.
+    for lh_i in range(20, 421, 5):
+        lh = lh_i / 100.0
+        for lv_i in range(20, 421, 5):
+            lv = lv_i / 100.0
+            err = _ajuste_poisson_objetivo(
+                lh, lv, objetivo_1x2, objetivo_o25, objetivo_o35
+            )
+            if err < mejor[0]:
+                mejor = (err, lh, lv)
+
+    # Segunda pasada: refinamiento alrededor del mejor punto.
+    _, centro_l, centro_v = mejor
+    inicio_l = max(0.20, centro_l - 0.12)
+    fin_l = min(4.50, centro_l + 0.12)
+    inicio_v = max(0.20, centro_v - 0.12)
+    fin_v = min(4.50, centro_v + 0.12)
+
+    paso = 0.01
+    l = inicio_l
+    while l <= fin_l + 1e-9:
+        v = inicio_v
+        while v <= fin_v + 1e-9:
+            err = _ajuste_poisson_objetivo(
+                l, v, objetivo_1x2, objetivo_o25, objetivo_o35
+            )
+            if err < mejor[0]:
+                mejor = (err, l, v)
+            v += paso
+        l += paso
+
+    return mejor[1], mejor[2], mejor[0]
+
+
+def _preparar_cdf_marcadores(lambda_local, lambda_visitante):
+    dist = _probabilidades_poisson(lambda_local, lambda_visitante)
+    acumuladas = []
+    marcadores = []
+    acumulado = 0.0
+    for gl, gv, p in dist:
+        acumulado += p
+        marcadores.append((gl, gv))
+        acumuladas.append(acumulado)
+    acumuladas[-1] = 1.0
+    return marcadores, acumuladas
+
+
+def _bloque_simulacion(iteraciones, marcadores, cdf_marcadores,
+                       promedio_tarjetas_arbitro, p_t35_base, p_t45_base,
+                       p_t55_base, corners_bases):
     exitos_1 = exitos_x = exitos_2 = 0
     over_25 = under_25 = over_35 = under_35 = 0
     btts_si_count = btts_no_count = 0
     t_over_35 = t_under_35 = t_over_45 = t_under_45 = t_over_55 = t_under_55 = 0
-    
+
     lineas_corners = [7.5, 8.5, 9.5, 10.5]
     corners_counts = {l: 0 for l in lineas_corners}
     corners_under_counts = {l: 0 for l in lineas_corners}
 
     for _ in range(iteraciones):
-        ritmo = random.gauss(1.0, 0.14)
-        
-        dado_1x2 = random.uniform(0, 100)
-        if dado_1x2 < p_l:
+        ritmo = max(0.50, random.gauss(1.0, 0.10))
+
+        idx = bisect.bisect_left(cdf_marcadores, random.random())
+        goles_local, goles_visitante = marcadores[idx]
+
+        if goles_local > goles_visitante:
             exitos_1 += 1
-            goles_local = random.choice([1, 2, 3, 4])
-            goles_visitante = random.choice([0, 1, 2])
-        elif dado_1x2 < (p_l + p_e):
+        elif goles_local == goles_visitante:
             exitos_x += 1
-            goles_local = random.choice([0, 1, 2])
-            goles_visitante = goles_local
         else:
             exitos_2 += 1
-            goles_local = random.choice([0, 1, 2])
-            goles_visitante = random.choice([1, 2, 3, 4])
 
         total_goles = goles_local + goles_visitante
-        if total_goles > 2.5:
+        if total_goles >= 3:
             over_25 += 1
         else:
             under_25 += 1
 
-        if total_goles > 3.5:
+        if total_goles >= 4:
             over_35 += 1
         else:
             under_35 += 1
@@ -237,33 +388,39 @@ def _bloque_simulacion(iteraciones, prob_1x2, prob_over_25, prob_over_35, promed
         else:
             btts_no_count += 1
 
-        t_val = random.gauss(promedio_tarjetas_arbitro, 1.2) * ritmo
-        if random.uniform(0, 100) < p_t35_base * (t_val / promedio_tarjetas_arbitro):
+        t_val = max(0.1, random.gauss(promedio_tarjetas_arbitro, 1.2) * ritmo)
+        factor_t = min(1.0, max(0.0, t_val / max(promedio_tarjetas_arbitro, 0.1)))
+
+        if random.random() * 100 < min(100.0, p_t35_base * factor_t):
             t_over_35 += 1
         else:
             t_under_35 += 1
 
-        if random.uniform(0, 100) < p_t45_base * (t_val / promedio_tarjetas_arbitro):
+        if random.random() * 100 < min(100.0, p_t45_base * factor_t):
             t_over_45 += 1
         else:
             t_under_45 += 1
 
-        if random.uniform(0, 100) < p_t55_base * (t_val / promedio_tarjetas_arbitro):
+        if random.random() * 100 < min(100.0, p_t55_base * factor_t):
             t_over_55 += 1
         else:
             t_under_55 += 1
 
-        c_val = random.gauss(9.5, 2.2) * ritmo
+        c_val = max(0.1, random.gauss(9.5, 2.2) * ritmo)
+        factor_c = min(1.0, max(0.0, c_val / 9.5))
         for linea in lineas_corners:
-            if random.uniform(0, 100) < corners_bases[linea] * (c_val / 9.5):
+            if random.random() * 100 < min(100.0, corners_bases[linea] * factor_c):
                 corners_counts[linea] += 1
             else:
                 corners_under_counts[linea] += 1
 
-    return (exitos_1, exitos_x, exitos_2, over_25, under_25, over_35, under_35, 
-            btts_si_count, btts_no_count,
-            t_over_35, t_under_35, t_over_45, t_under_45, t_over_55, t_under_55, 
-            corners_counts, corners_under_counts)
+    return (
+        exitos_1, exitos_x, exitos_2, over_25, under_25, over_35, under_35,
+        btts_si_count, btts_no_count,
+        t_over_35, t_under_35, t_over_45, t_under_45, t_over_55, t_under_55,
+        corners_counts, corners_under_counts
+    )
+
 
 def simular_escenarios_con_pinnacle(
     cuota_local: float, cuota_empate: float, cuota_visitante: float,
@@ -276,49 +433,53 @@ def simular_escenarios_con_pinnacle(
     c_c_mas_75: float = 1.20, c_c_menos_75: float = 4.00,
     c_c_mas_85: float = 1.45, c_c_menos_85: float = 2.60,
     c_c_mas_95: float = 1.85, c_c_menos_95: float = 1.90,
-    c_c_mas_105: float = 2.40, c_c_menos_105: float = 1.55
+    c_c_mas_105: float = 2.40, c_c_menos_105: float = 1.55,
+    cuota_btts_si: float = None, cuota_btts_no: float = None
 ) -> dict:
-    
-    p_l_bruta = 1.0 / cuota_local
-    p_e_bruta = 1.0 / cuota_empate
-    p_v_bruta = 1.0 / cuota_visitante
-    suma_1x2 = p_l_bruta + p_e_bruta + p_v_bruta
-    
-    p_local_real = (p_l_bruta / suma_1x2) * 100.0
-    p_empate_real = (p_e_bruta / suma_1x2) * 100.0
-    p_visitante_real = (p_v_bruta / suma_1x2) * 100.0
+    # Probabilidades de mercado sin margen.
+    p_local_real, p_empate_real, p_visitante_real = _ajustar_1x2(
+        cuota_local, cuota_empate, cuota_visitante
+    )
+    prob_over_25_base, prob_under_25_base = _ajustar_probabilidades_cuota(
+        cuota_mas_25, cuota_menos_25
+    )
+    prob_over_35_base, prob_under_35_base = _ajustar_probabilidades_cuota(
+        cuota_mas_35, cuota_menos_35
+    )
 
-    def get_prob_over(c_o, c_u):
-        po = 1.0 / c_o
-        pu = 1.0 / c_u
-        return (po / (po + pu)) * 100.0
+    # Nuevo núcleo: inferencia de goles coherente con 1X2 + líneas de goles.
+    lambda_local, lambda_visitante, error_calibracion = _calibrar_lambdas(
+        cuota_local, cuota_empate, cuota_visitante,
+        cuota_mas_25, cuota_menos_25,
+        cuota_mas_35, cuota_menos_35
+    )
+    metricas_base = _metricas_modelo(lambda_local, lambda_visitante)
+    marcadores, cdf_marcadores = _preparar_cdf_marcadores(lambda_local, lambda_visitante)
 
-    prob_over_25_base = get_prob_over(cuota_mas_25, cuota_menos_25)
-    prob_over_35_base = get_prob_over(cuota_mas_35, cuota_menos_35)
-
-    p_t35_base = get_prob_over(c_t_mas_35, c_t_menos_35)
-    p_t45_base = get_prob_over(c_t_mas_45, c_t_menos_45)
-    p_t55_base = get_prob_over(c_t_mas_55, c_t_menos_55)
+    p_t35_base, _ = _ajustar_probabilidades_cuota(c_t_mas_35, c_t_menos_35)
+    p_t45_base, _ = _ajustar_probabilidades_cuota(c_t_mas_45, c_t_menos_45)
+    p_t55_base, _ = _ajustar_probabilidades_cuota(c_t_mas_55, c_t_menos_55)
 
     corners_bases = {
-        7.5: get_prob_over(c_c_mas_75, c_c_menos_75),
-        8.5: get_prob_over(c_c_mas_85, c_c_menos_85),
-        9.5: get_prob_over(c_c_mas_95, c_c_menos_95),
-        10.5: get_prob_over(c_c_mas_105, c_c_menos_105)
+        7.5: _ajustar_probabilidades_cuota(c_c_mas_75, c_c_menos_75)[0],
+        8.5: _ajustar_probabilidades_cuota(c_c_mas_85, c_c_menos_85)[0],
+        9.5: _ajustar_probabilidades_cuota(c_c_mas_95, c_c_menos_95)[0],
+        10.5: _ajustar_probabilidades_cuota(c_c_mas_105, c_c_menos_105)[0]
     }
 
     total_escenarios = 50000
     hilos = 4
     bloque = total_escenarios // hilos
-
-    prob_1x2 = (p_local_real, p_empate_real, p_visitante_real)
     resultados_hilos = []
 
     with ThreadPoolExecutor(max_workers=hilos) as executor:
         futures = [
             executor.submit(
-                _bloque_simulacion, bloque, prob_1x2, prob_over_25_base, prob_over_35_base, 
-                promedio_tarjetas_arbitro, p_t35_base, p_t45_base, p_t55_base, corners_bases
+                _bloque_simulacion,
+                bloque, marcadores, cdf_marcadores,
+                promedio_tarjetas_arbitro,
+                p_t35_base * 100.0, p_t45_base * 100.0, p_t55_base * 100.0,
+                {k: v * 100.0 for k, v in corners_bases.items()}
             )
             for _ in range(hilos)
         ]
@@ -334,19 +495,19 @@ def simular_escenarios_con_pinnacle(
     under_35_goles = sum(r[6] for r in resultados_hilos)
     btts_si_tot = sum(r[7] for r in resultados_hilos)
     btts_no_tot = sum(r[8] for r in resultados_hilos)
-    
+
     t_over_35 = sum(r[9] for r in resultados_hilos)
     t_under_35 = sum(r[10] for r in resultados_hilos)
     t_over_45 = sum(r[11] for r in resultados_hilos)
     t_under_45 = sum(r[12] for r in resultados_hilos)
     t_over_55 = sum(r[13] for r in resultados_hilos)
     t_under_55 = sum(r[14] for r in resultados_hilos)
-    
+
     corners_counts = {k: sum(r[15][k] for r in resultados_hilos) for k in [7.5, 8.5, 9.5, 10.5]}
     corners_under_counts = {k: sum(r[16][k] for r in resultados_hilos) for k in [7.5, 8.5, 9.5, 10.5]}
 
     n = float(total_escenarios)
-    return {
+    sim = {
         "p_1": round((exitos_1 / n) * 100.0, 1),
         "p_x": round((exitos_x / n) * 100.0, 1),
         "p_2": round((exitos_2 / n) * 100.0, 1),
@@ -366,11 +527,77 @@ def simular_escenarios_con_pinnacle(
         "corners_menos": {k: round((v / n) * 100.0, 1) for k, v in corners_under_counts.items()}
     }
 
+    # ------------------------------------------
+    # EDGE / VALOR CRUZADO
+    # ------------------------------------------
+    mercados = []
+
+    def agregar(nombre, prob_modelo, prob_mercado, cuota):
+        if cuota is None or cuota <= 1.0:
+            return
+        edge = prob_modelo - (prob_mercado * 100.0)
+        # El score premia probabilidad alta, pero exige respaldo de edge.
+        # Un edge negativo se penaliza para que no domine el Top 3.
+        edge_pos = max(0.0, edge)
+        penalizacion = max(0.0, -edge)
+        score = (prob_modelo / 100.0) * (1.0 + 4.0 * edge_pos / 100.0) - 1.5 * (penalizacion / 100.0)
+        mercados.append({
+            "nombre": nombre,
+            "probabilidad": round(prob_modelo, 1),
+            "probabilidad_mercado": round(prob_mercado * 100.0, 1),
+            "edge": round(edge, 1),
+            "cuota": cuota,
+            "score": round(score, 4)
+        })
+
+    agregar("Victoria Local (1)", sim["p_1"], p_local_real, cuota_local)
+    agregar("Empate (X)", sim["p_x"], p_empate_real, cuota_empate)
+    agregar("Victoria Visitante (2)", sim["p_2"], p_visitante_real, cuota_visitante)
+    agregar("Más de 2.5 Goles", sim["over_25"], prob_over_25_base, cuota_mas_25)
+    agregar("Menos de 2.5 Goles", sim["under_25"], prob_under_25_base, cuota_menos_25)
+    agregar("Más de 3.5 Goles", sim["over_35"], prob_over_35_base, cuota_mas_35)
+    agregar("Menos de 3.5 Goles", sim["under_35"], prob_under_35_base, cuota_menos_35)
+
+    btts_disponible = cuota_btts_si is not None and cuota_btts_no is not None and cuota_btts_si > 1 and cuota_btts_no > 1
+    if btts_disponible:
+        p_btts_si_m, p_btts_no_m = _ajustar_probabilidades_cuota(cuota_btts_si, cuota_btts_no)
+        agregar("Ambos Anotan (Sí)", sim["btts_si"], p_btts_si_m, cuota_btts_si)
+        agregar("Ambos Anotan (No)", sim["btts_no"], p_btts_no_m, cuota_btts_no)
+        btts_market = {
+            "si": round(p_btts_si_m * 100.0, 1),
+            "no": round(p_btts_no_m * 100.0, 1),
+            "cuota_si": cuota_btts_si,
+            "cuota_no": cuota_btts_no,
+            "edge_si": round(sim["btts_si"] - p_btts_si_m * 100.0, 1),
+            "edge_no": round(sim["btts_no"] - p_btts_no_m * 100.0, 1)
+        }
+    else:
+        btts_market = {"disponible": False}
+
+    # Si no existe valor positivo, no inventamos una ventaja.
+    positivos = [m for m in mercados if m["edge"] > 0.5]
+    if len(positivos) >= 3:
+        ranking = sorted(positivos, key=lambda x: (x["score"], x["probabilidad"]), reverse=True)
+    else:
+        ranking = sorted(mercados, key=lambda x: (x["score"], x["probabilidad"]), reverse=True)
+
+    return {
+        **sim,
+        "lambda_local": round(lambda_local, 3),
+        "lambda_visitante": round(lambda_visitante, 3),
+        "error_calibracion": round(error_calibracion, 5),
+        "mercados_valor": ranking[:9],
+        "top_3_detallado": ranking[:3],
+        "btts_referencia_pinnacle": btts_market,
+        "modelo_metodo": "Poisson calibrado con 1X2 + Over/Under; BTTS como validación independiente",
+        "escenarios": total_escenarios
+    }
+
 @app.get("/")
 def home():
     return {"mensaje": "API Master Pro - Motor Estocástico con Base de Datos e Historial Activo"}
 
-# --- RUTA 1: FASE SUPERIOR (CORREGIDA PARA VARIABILIDAD EN TOP 3) ---
+# --- RUTA 1: FASE SUPERIOR ---
 @app.get("/analisis/partido")
 def analizar_partido(
     cuota_local: float = 3.03,
@@ -379,47 +606,26 @@ def analizar_partido(
     cuota_mas_25_goles: float = 1.95,
     cuota_menos_25_goles: float = 1.85,
     cuota_mas_35_goles: float = 3.40,
-    cuota_menos_35_goles: float = 1.32
+    cuota_menos_35_goles: float = 1.32,
+    cuota_btts_si: float = None,
+    cuota_btts_no: float = None
 ):
     try:
         sim = simular_escenarios_con_pinnacle(
             cuota_local, cuota_empate, cuota_visitante,
             cuota_mas_25_goles, cuota_menos_25_goles,
-            cuota_mas_35_goles, cuota_menos_35_goles
+            cuota_mas_35_goles, cuota_menos_35_goles,
+            cuota_btts_si=cuota_btts_si,
+            cuota_btts_no=cuota_btts_no
         )
-        
-        # Separamos en grupos lógicos para garantizar diversidad y evitar que el BTTS monopolice siempre el top
-        candidatos_1x2 = [
-            {"prob": sim['p_1'], "texto": f"Victoria Local (1): {sim['p_1']}%"},
-            {"prob": sim['p_x'], "texto": f"Empate Técnico (X): {sim['p_x']}%"},
-            {"prob": sim['p_2'], "texto": f"Victoria Visitante (2): {sim['p_2']}%"}
-        ]
-        
-        candidatos_goles_btts = [
-            {"prob": sim['over_25'], "texto": f"Más de 2.5 Goles: {sim['over_25']}%"},
-            {"prob": sim['under_25'], "texto": f"Menos de 2.5 Goles: {sim['under_25']}%"},
-            {"prob": sim['over_35'], "texto": f"Más de 3.5 Goles: {sim['over_35']}%"},
-            {"prob": sim['under_35'], "texto": f"Menos de 3.5 Goles: {sim['under_35']}%"},
-            {"prob": sim['btts_si'], "texto": f"Ambos Anotan (Sí): {sim['btts_si']}%"},
-            {"prob": sim['btts_no'], "texto": f"Ambos Anotan (No): {sim['btts_no']}%"}
-        ]
 
-        # Ordenamos de mayor a menor probabilidad independientemente
-        candidatos_1x2.sort(key=lambda x: x["prob"], reverse=True)
-        candidatos_goles_btts.sort(key=lambda x: x["prob"], reverse=True)
-
-        # Construimos un Top 3 balanceado (1 del mercado de ganador y 2 de goles/BTTS)
-        top_3_variado = [
-            candidatos_1x2[0],          
-            candidatos_goles_btts[0],   
-            candidatos_goles_btts[1]    
+        candidatos_top = [
+            f"{m['nombre']}: {m['probabilidad']}% | Edge {m['edge']:+.1f}%"
+            for m in sim["top_3_detallado"]
         ]
-        
-        # Ordenamos estéticamente el top 3 final por porcentaje de mayor a menor
-        top_3_variado.sort(key=lambda x: x["prob"], reverse=True)
 
         return {
-            "aviso_legal_licencia": "NOTA: Análisis matemático estocástico avanzado de 50,000 iteraciones.",
+            "aviso_legal_licencia": "NOTA: Análisis matemático estocástico avanzado de 50,000 iteraciones. No constituye garantía de resultado.",
             "origen": "Fase 1 - 1X2, Goles y BTTS (Pinnacle)",
             "probabilidades_1x2_simuladas": {
                 "local": f"{sim['p_1']}%",
@@ -434,12 +640,17 @@ def analizar_partido(
                 "btts_si": f"{sim['btts_si']}%",
                 "btts_no": f"{sim['btts_no']}%"
             },
-            "top_3_recomendaciones": [
-                top_3_variado[0]['texto'],
-                top_3_variado[1]['texto'],
-                top_3_variado[2]['texto']
-            ],
-            "estado": "Simulación completada con éxito (50k escenarios)"
+            "top_3_recomendaciones": candidatos_top,
+            "top_3_detallado": sim["top_3_detallado"],
+            "mercados_valor": sim["mercados_valor"],
+            "btts_referencia_pinnacle": sim["btts_referencia_pinnacle"],
+            "modelo": {
+                "metodo": sim["modelo_metodo"],
+                "goles_esperados_local": sim["lambda_local"],
+                "goles_esperados_visitante": sim["lambda_visitante"],
+                "error_calibracion": sim["error_calibracion"]
+            },
+            "estado": "Simulación completada con éxito (50k escenarios + Poisson calibrado)"
         }
     except Exception as e:
         return {"error": f"Error en el servidor: {str(e)}"}
