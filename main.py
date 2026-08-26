@@ -4,12 +4,12 @@ from pydantic import BaseModel
 import random
 from concurrent.futures import ThreadPoolExecutor
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 
 app = FastAPI(
     title="API Master Pro - Pinnacle Optimized Edition",
     description="Motor de simulación matemática avanzada de 50,000 escenarios con base de datos e historial",
-    version="6.0.0"
+    version="7.0.0"
 )
 
 # Configuración de CORS
@@ -27,13 +27,15 @@ app.add_middleware(
 def inicializar_db():
     conn = sqlite3.connect("database.db")
     cursor = conn.cursor()
-    # Tabla de Usuarios
+    # Tabla de Usuarios con Correo y Fechas de Suscripción (3 meses iniciales gratis)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS usuarios (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             usuario TEXT UNIQUE NOT NULL,
+            correo TEXT UNIQUE NOT NULL,
             password TEXT NOT NULL,
-            codigo_pago TEXT UNIQUE NOT NULL,
+            plan TEXT DEFAULT 'prueba_3_meses',
+            fecha_expiracion TEXT,
             activo INTEGER DEFAULT 1
         )
     """)
@@ -55,8 +57,8 @@ inicializar_db()
 # Modelos Pydantic para las peticiones HTTP
 class RegistroSchema(BaseModel):
     usuario: str
+    correo: str
     password: str
-    codigo_pago: str
 
 class LoginSchema(BaseModel):
     usuario: str
@@ -75,20 +77,23 @@ def registrar_usuario(data: RegistroSchema):
     conn = sqlite3.connect("database.db")
     cursor = conn.cursor()
     try:
-        # Verificar si el código de pago ya fue usado por otra persona
-        cursor.execute("SELECT id FROM usuarios WHERE codigo_pago = ?", (data.codigo_pago,))
-        if cursor.fetchone():
-            raise HTTPException(status_code=400, detail="Este código de pago ya está asociado a otra cuenta o ya fue utilizado.")
+        # Asignar automáticamente 3 meses (90 días) de acceso gratuito al registrarse
+        fecha_actual = datetime.now()
+        fecha_vencimiento = fecha_actual + timedelta(days=90)
         
-        # Insertar nuevo usuario
         cursor.execute(
-            "INSERT INTO usuarios (usuario, password, codigo_pago) VALUES (?, ?, ?)",
-            (data.usuario, data.password, data.codigo_pago)
+            "INSERT INTO usuarios (usuario, correo, password, plan, fecha_expiracion) VALUES (?, ?, ?, ?, ?)",
+            (data.usuario, data.correo, data.password, 'prueba_3_meses', fecha_vencimiento.strftime("%Y-%m-%d %H:%M:%S"))
         )
         conn.commit()
-        return {"mensaje": "Registro exitoso", "usuario": data.usuario}
+        return {
+            "mensaje": "¡Registro exitoso! Cuentas con 3 meses de acceso ilimitado.",
+            "usuario": data.usuario,
+            "correo": data.correo,
+            "expiracion": fecha_vencimiento.strftime("%Y-%m-%d")
+        }
     except sqlite3.IntegrityError:
-        raise HTTPException(status_code=400, detail="El nombre de usuario ya existe o el código ya fue registrado.")
+        raise HTTPException(status_code=400, detail="El nombre de usuario o el correo electrónico ya se encuentran registrados.")
     finally:
         conn.close()
 
@@ -96,7 +101,7 @@ def registrar_usuario(data: RegistroSchema):
 def login_usuario(data: LoginSchema):
     conn = sqlite3.connect("database.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT id, codigo_pago FROM usuarios WHERE usuario = ? AND password = ?", (data.usuario, data.password))
+    cursor.execute("SELECT id, correo, plan, fecha_expiracion FROM usuarios WHERE usuario = ? AND password = ?", (data.usuario, data.password))
     user = cursor.fetchone()
     conn.close()
     
@@ -106,7 +111,9 @@ def login_usuario(data: LoginSchema):
     return {
         "mensaje": "Login exitoso",
         "usuario": data.usuario,
-        "codigo_pago": user[1]
+        "correo": user[1],
+        "plan": user[2],
+        "fecha_expiracion": user[3]
     }
 
 # ==========================================
