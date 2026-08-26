@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 app = FastAPI(
     title="API Master Pro - Pinnacle Optimized Edition",
     description="Motor de simulación matemática avanzada de 50,000 escenarios con base de datos e historial",
-    version="7.0.0"
+    version="8.0.0"
 )
 
 # Configuración de CORS
@@ -27,18 +27,20 @@ app.add_middleware(
 def inicializar_db():
     conn = sqlite3.connect("database.db")
     cursor = conn.cursor()
-    # Tabla de Usuarios con Correo y Fechas de Suscripción (3 meses iniciales gratis)
+    
+    # Tabla de Usuarios (Registro gratuito con usuario, correo y contraseña)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS usuarios (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             usuario TEXT UNIQUE NOT NULL,
             correo TEXT UNIQUE NOT NULL,
             password TEXT NOT NULL,
-            plan TEXT DEFAULT 'prueba_3_meses',
+            plan TEXT DEFAULT 'gratis',
             fecha_expiracion TEXT,
             activo INTEGER DEFAULT 1
         )
     """)
+    
     # Tabla de Historial de Análisis
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS historial (
@@ -64,6 +66,10 @@ class LoginSchema(BaseModel):
     usuario: str
     password: str
 
+class ActivarPlanSchema(BaseModel):
+    usuario: str
+    tipo_plan: str  # '1_mes', '3_meses', '12_meses'
+
 class GuardarHistorialSchema(BaseModel):
     usuario: str
     partido_resumen: str
@@ -77,20 +83,16 @@ def registrar_usuario(data: RegistroSchema):
     conn = sqlite3.connect("database.db")
     cursor = conn.cursor()
     try:
-        # Asignar automáticamente 3 meses (90 días) de acceso gratuito al registrarse
-        fecha_actual = datetime.now()
-        fecha_vencimiento = fecha_actual + timedelta(days=90)
-        
+        # La cuenta se crea gratis sin fecha de expiración forzosa inicial (o plan 'gratis')
         cursor.execute(
-            "INSERT INTO usuarios (usuario, correo, password, plan, fecha_expiracion) VALUES (?, ?, ?, ?, ?)",
-            (data.usuario, data.correo, data.password, 'prueba_3_meses', fecha_vencimiento.strftime("%Y-%m-%d %H:%M:%S"))
+            "INSERT INTO usuarios (usuario, correo, password, plan) VALUES (?, ?, ?, ?)",
+            (data.usuario, data.correo, data.password, 'gratis')
         )
         conn.commit()
         return {
-            "mensaje": "¡Registro exitoso! Cuentas con 3 meses de acceso ilimitado.",
+            "mensaje": "¡Cuenta creada con éxito! Ya puedes ver tu historial.",
             "usuario": data.usuario,
-            "correo": data.correo,
-            "expiracion": fecha_vencimiento.strftime("%Y-%m-%d")
+            "correo": data.correo
         }
     except sqlite3.IntegrityError:
         raise HTTPException(status_code=400, detail="El nombre de usuario o el correo electrónico ya se encuentran registrados.")
@@ -117,26 +119,68 @@ def login_usuario(data: LoginSchema):
     }
 
 # ==========================================
-# RUTAS DE HISTORIAL DE BÚSQUEDAS
+# CONTROL DE PAGOS Y PLANES (1 Mes: 12k, 3 Meses: 36k, 12 Meses: 100k)
+# ==========================================
+@app.post("/suscripcion/activar")
+def activar_plan(data: ActivarPlanSchema):
+    conn = sqlite3.connect("database.db")
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT id FROM usuarios WHERE usuario = ?", (data.usuario,))
+    if not cursor.fetchone():
+        conn.close()
+        raise HTTPException(status_code=404, detail="Usuario no encontrado.")
+    
+    base_fecha = datetime.now()
+    if data.tipo_plan == '1_mes':
+        nueva_exp = base_fecha + timedelta(days=30)
+    elif data.tipo_plan == '3_meses':
+        nueva_exp = base_fecha + timedelta(days=90)
+    elif data.tipo_plan == '12_meses':
+        nueva_exp = base_fecha + timedelta(days=365)
+    else:
+        conn.close()
+        raise HTTPException(status_code=400, detail="Plan no válido.")
+
+    cursor.execute(
+        "UPDATE usuarios SET plan = ?, fecha_expiracion = ? WHERE usuario = ?",
+        (data.tipo_plan, nueva_exp.strftime("%Y-%m-%d %H:%M:%S"), data.usuario)
+    )
+    conn.commit()
+    conn.close()
+    
+    return {
+        "mensaje": f"Plan {data.tipo_plan} activado correctamente.",
+        "nueva_expiracion": nueva_exp.strftime("%Y-%m-%d")
+    }
+
+# ==========================================
+# RUTAS DE HISTORIAL (MÁXIMO LOS ÚLTIMOS 20 PARTIDOS)
 # ==========================================
 @app.post("/historial/guardar")
 def guardar_historial(data: GuardarHistorialSchema):
     conn = sqlite3.connect("database.db")
     cursor = conn.cursor()
     fecha_actual = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    # Guardamos la nueva búsqueda
     cursor.execute(
         "INSERT INTO historial (usuario, fecha, partido_resumen, datos_json) VALUES (?, ?, ?, ?)",
         (data.usuario, fecha_actual, data.partido_resumen, data.datos_json)
     )
     conn.commit()
+    
+    # Opcional para mantener limpia la BD: conservar solo registros recientes si se desea, 
+    # pero el endpoint de lectura ya limita a los últimos 20.
     conn.close()
-    return {"mensaje": "Análisis guardado en el historial con éxito"}
+    return {"mensaje": "Análisis guardado con éxito"}
 
 @app.get("/historial/{usuario}")
 def ver_historial(usuario: str):
     conn = sqlite3.connect("database.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT fecha, partido_resumen, datos_json FROM historial WHERE usuario = ? ORDER BY id DESC", (usuario,))
+    # Limitamos estrictamente a los últimos 20 partidos buscados por el usuario
+    cursor.execute("SELECT fecha, partido_resumen, datos_json FROM historial WHERE usuario = ? ORDER BY id DESC LIMIT 20", (usuario,))
     resultados = cursor.fetchall()
     conn.close()
     
