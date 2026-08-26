@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 app = FastAPI(
     title="API Master Pro - Pinnacle Optimized Edition",
     description="Motor de simulación matemática avanzada de 50,000 escenarios con base de datos e historial",
-    version="8.1.0"
+    version="8.3.0"
 )
 
 # Configuración de CORS
@@ -274,6 +274,11 @@ def _ajustar_1x2(c_local, c_empate, c_visitante):
     return tuple(x / total for x in bruto)
 
 
+def _probabilidades_casa_1x2(c_local, c_empate, c_visitante):
+    """Probabilidades sin margen de la casa donde se apuesta (1X2)."""
+    return _ajustar_1x2(c_local, c_empate, c_visitante)
+
+
 def _ajuste_poisson_objetivo(lh, lv, objetivo_1x2, objetivo_over25, objetivo_over35):
     m = _metricas_modelo(lh, lv)
     error_1x2 = sum((a - b) ** 2 for a, b in zip(
@@ -434,7 +439,13 @@ def simular_escenarios_con_pinnacle(
     c_c_mas_85: float = 1.45, c_c_menos_85: float = 2.60,
     c_c_mas_95: float = 1.85, c_c_menos_95: float = 1.90,
     c_c_mas_105: float = 2.40, c_c_menos_105: float = 1.55,
-    cuota_btts_si: float = None, cuota_btts_no: float = None
+    cuota_btts_si: float = None, cuota_btts_no: float = None,
+    # Cuotas de la casa donde el usuario apuesta. NO calibran el modelo;
+    # solo se usan para calcular valor/EV contra el precio disponible.
+    casa_local: float = None, casa_empate: float = None, casa_visitante: float = None,
+    casa_mas_25: float = None, casa_menos_25: float = None,
+    casa_mas_35: float = None, casa_menos_35: float = None,
+    casa_btts_si: float = None, casa_btts_no: float = None
 ) -> dict:
     # Probabilidades de mercado sin margen.
     p_local_real, p_empate_real, p_visitante_real = _ajustar_1x2(
@@ -538,24 +549,20 @@ def simular_escenarios_con_pinnacle(
 
     mercados = []
 
-    # Medimos qué tan bien encaja el modelo de goles con los mercados usados
-    # para calibrarlo. Menor error = mayor confianza estructural.
     rmse_calibracion_pp = math.sqrt(max(error_calibracion, 0.0) / 5.0) * 100.0
     confianza_ajuste = max(0.45, min(1.0, 1.0 - (rmse_calibracion_pp / 10.0)))
 
-    def agregar(nombre, prob_modelo, prob_mercado, cuota, prob_simulada=None):
-        if cuota is None or cuota <= 1.0:
+    def agregar(nombre, prob_modelo, prob_pinnacle, cuota_pinnacle,
+                cuota_casa, prob_casa=None, prob_simulada=None):
+        # La casa de apuesta es opcional para no romper consultas antiguas.
+        # Si no se proporciona, el mercado queda como REFERENCIA, no como valuebet.
+        if cuota_pinnacle is None or cuota_pinnacle <= 1.0:
             return
 
-        # Para el ranking usamos la probabilidad analítica del modelo, no el
-        # ruido de muestreo de las 50k simulaciones. La simulación sigue siendo
-        # el motor de comprobación y se muestra al usuario.
         p_modelo = max(0.0, min(1.0, prob_modelo / 100.0))
-        p_mercado = max(0.0, min(1.0, prob_mercado))
-        edge = (p_modelo - p_mercado) * 100.0
-        ev = (p_modelo * cuota - 1.0) * 100.0
+        p_pinnacle = max(0.0, min(1.0, prob_pinnacle))
+        edge_pinnacle = (p_modelo - p_pinnacle) * 100.0
 
-        # Acuerdo entre la simulación y la probabilidad analítica.
         if prob_simulada is None:
             confianza_sim = 1.0
         else:
@@ -563,71 +570,109 @@ def simular_escenarios_con_pinnacle(
             confianza_sim = max(0.75, min(1.0, 1.0 - diferencia_sim_pp / 5.0))
 
         confianza = max(0.0, min(1.0, confianza_ajuste * confianza_sim))
-        score_valor = ev * confianza
 
-        if ev >= 5.0 and edge >= 3.0:
-            nivel = "VALOR FUERTE"
-            accion = "RECOMENDADO"
-        elif ev >= 3.0 and edge >= 1.5:
-            nivel = "VALOR BUENO"
-            accion = "RECOMENDADO"
-        elif ev >= 1.5 and edge >= 1.0:
-            nivel = "VALOR LEVE"
-            accion = "RECOMENDACIÓN CAUTELOSA"
-        else:
-            nivel = "SIN VALOR SUFICIENTE"
-            accion = "NO RECOMENDADO"
+        # Por defecto no recomendamos usando Pinnacle como si fuera la casa final.
+        cuota_evaluada = cuota_casa if cuota_casa is not None and cuota_casa > 1.0 else cuota_pinnacle
+        p_casa = None if prob_casa is None else max(0.0, min(1.0, prob_casa))
+        edge_casa = None if p_casa is None else (p_modelo - p_casa) * 100.0
+        ev_casa = (p_modelo * cuota_casa - 1.0) * 100.0 if cuota_casa is not None and cuota_casa > 1.0 else None
+        ev_pinnacle = (p_modelo * cuota_pinnacle - 1.0) * 100.0
 
-        if ev <= 0:
+        # Si existe cuota de la casa, el ranking se hace contra ESA cuota.
+        # Si no existe, no se fuerza una recomendación.
+        if ev_casa is None or edge_casa is None:
+            nivel = "PENDIENTE DE CUOTA DE APUESTA"
+            accion = "NO EVALUABLE"
+            score_valor = None
             explicacion = (
-                f"El modelo estima {prob_modelo:.1f}% y la cuota {cuota:.2f} "
-                f"no compensa el riesgo (EV {ev:+.1f}%)."
-            )
-        elif edge < 1.0:
-            explicacion = (
-                f"Hay probabilidad favorable ({prob_modelo:.1f}%), pero la ventaja "
-                f"frente al mercado es demasiado pequeña (edge {edge:+.1f}%)."
-            )
-        elif ev < 1.5:
-            explicacion = (
-                f"Existe una pequeña ventaja estadística (edge {edge:+.1f}%), "
-                f"pero el valor esperado es insuficiente (EV {ev:+.1f}%)."
+                f"El modelo estima {prob_modelo:.1f}%. Pinnacle sirve como referencia "
+                f"({cuota_pinnacle:.2f}), pero falta la cuota de la casa donde vas a apostar; "
+                f"por eso no se calcula una recomendación de valor."
             )
         else:
-            explicacion = (
-                f"El modelo estima {prob_modelo:.1f}% frente a {p_mercado*100:.1f}% "
-                f"del mercado sin margen: edge {edge:+.1f}% y EV {ev:+.1f}%."
-            )
+            score_valor = ev_casa * confianza
+            if ev_casa >= 5.0 and edge_casa >= 3.0:
+                nivel = "VALOR FUERTE"
+                accion = "RECOMENDADO"
+            elif ev_casa >= 3.0 and edge_casa >= 1.5:
+                nivel = "VALOR BUENO"
+                accion = "RECOMENDADO"
+            elif ev_casa >= 1.5 and edge_casa >= 1.0:
+                nivel = "VALOR LEVE"
+                accion = "RECOMENDACIÓN CAUTELOSA"
+            else:
+                nivel = "SIN VALOR SUFICIENTE"
+                accion = "NO RECOMENDADO"
+
+            if ev_casa <= 0:
+                explicacion = (
+                    f"El modelo estima {prob_modelo:.1f}% y la cuota de tu casa {cuota_casa:.2f} "
+                    f"no compensa el riesgo (EV {ev_casa:+.1f}%). Pinnacle: {cuota_pinnacle:.2f}."
+                )
+            elif edge_casa < 1.0:
+                explicacion = (
+                    f"La probabilidad del modelo ({prob_modelo:.1f}%) apenas supera la "
+                    f"probabilidad implícita de tu casa ({p_casa*100:.1f}%). Edge {edge_casa:+.1f}%."
+                )
+            elif ev_casa < 1.5:
+                explicacion = (
+                    f"Hay ventaja frente a tu casa (edge {edge_casa:+.1f}%), pero el EV "
+                    f"todavía es pequeño ({ev_casa:+.1f}%)."
+                )
+            else:
+                explicacion = (
+                    f"El modelo estima {prob_modelo:.1f}% frente a {p_casa*100:.1f}% "
+                    f"implícito en tu casa: edge {edge_casa:+.1f}% y EV {ev_casa:+.1f}%. "
+                    f"Pinnacle de referencia: {cuota_pinnacle:.2f}."
+                )
 
         mercados.append({
             "nombre": nombre,
             "probabilidad": round(prob_modelo, 1),
             "probabilidad_simulada": round(float(prob_simulada), 1) if prob_simulada is not None else round(prob_modelo, 1),
-            "probabilidad_mercado": round(p_mercado * 100.0, 1),
-            "edge": round(edge, 1),
-            "cuota": cuota,
-            "ev": round(ev, 2),
+            "probabilidad_pinnacle": round(p_pinnacle * 100.0, 1),
+            "probabilidad_casa": round(p_casa * 100.0, 1) if p_casa is not None else None,
+            "edge_pinnacle": round(edge_pinnacle, 1),
+            "edge": round(edge_casa, 1) if edge_casa is not None else None,
+            "cuota_pinnacle": cuota_pinnacle,
+            "cuota_casa": cuota_casa,
+            "cuota": cuota_evaluada,
+            "ev_pinnacle": round(ev_pinnacle, 2),
+            "ev": round(ev_casa, 2) if ev_casa is not None else None,
             "confianza": round(confianza * 100.0, 1),
-            "score_valor": round(score_valor, 2),
+            "score_valor": round(score_valor, 2) if score_valor is not None else None,
             "nivel": nivel,
             "accion": accion,
             "explicacion": explicacion
         })
 
     # Probabilidades analíticas para que el Top no dependa del azar de las 50k.
-    agregar("Victoria Local (1)", metricas_base["p_1"], p_local_real, cuota_local, sim["p_1"])
-    agregar("Empate (X)", metricas_base["p_x"], p_empate_real, cuota_empate, sim["p_x"])
-    agregar("Victoria Visitante (2)", metricas_base["p_2"], p_visitante_real, cuota_visitante, sim["p_2"])
-    agregar("Más de 2.5 Goles", metricas_base["over_25"], prob_over_25_base, cuota_mas_25, sim["over_25"])
-    agregar("Menos de 2.5 Goles", metricas_base["under_25"], prob_under_25_base, cuota_menos_25, sim["under_25"])
-    agregar("Más de 3.5 Goles", metricas_base["over_35"], prob_over_35_base, cuota_mas_35, sim["over_35"])
-    agregar("Menos de 3.5 Goles", metricas_base["under_35"], prob_under_35_base, cuota_menos_35, sim["under_35"])
+    casa_1x2 = None
+    if all(x is not None and x > 1 for x in (casa_local, casa_empate, casa_visitante)):
+        casa_1x2 = _ajustar_1x2(casa_local, casa_empate, casa_visitante)
+
+    def casa_2way(a, b):
+        if a is None or b is None or a <= 1 or b <= 1:
+            return (None, None)
+        return _ajustar_probabilidades_cuota(a, b)
+
+    casa_o25, casa_u25 = casa_2way(casa_mas_25, casa_menos_25)
+    casa_o35, casa_u35 = casa_2way(casa_mas_35, casa_menos_35)
+    casa_btts_si_p, casa_btts_no_p = casa_2way(casa_btts_si, casa_btts_no)
+
+    agregar("Victoria Local (1)", metricas_base["p_1"], p_local_real, cuota_local, casa_local, casa_1x2[0] if casa_1x2 else None, sim["p_1"])
+    agregar("Empate (X)", metricas_base["p_x"], p_empate_real, cuota_empate, casa_empate, casa_1x2[1] if casa_1x2 else None, sim["p_x"])
+    agregar("Victoria Visitante (2)", metricas_base["p_2"], p_visitante_real, cuota_visitante, casa_visitante, casa_1x2[2] if casa_1x2 else None, sim["p_2"])
+    agregar("Más de 2.5 Goles", metricas_base["over_25"], prob_over_25_base, cuota_mas_25, casa_mas_25, casa_o25, sim["over_25"])
+    agregar("Menos de 2.5 Goles", metricas_base["under_25"], prob_under_25_base, cuota_menos_25, casa_menos_25, casa_u25, sim["under_25"])
+    agregar("Más de 3.5 Goles", metricas_base["over_35"], prob_over_35_base, cuota_mas_35, casa_mas_35, casa_o35, sim["over_35"])
+    agregar("Menos de 3.5 Goles", metricas_base["under_35"], prob_under_35_base, cuota_menos_35, casa_menos_35, casa_u35, sim["under_35"])
 
     btts_disponible = cuota_btts_si is not None and cuota_btts_no is not None and cuota_btts_si > 1 and cuota_btts_no > 1
     if btts_disponible:
         p_btts_si_m, p_btts_no_m = _ajustar_probabilidades_cuota(cuota_btts_si, cuota_btts_no)
-        agregar("Ambos Anotan (Sí)", metricas_base["btts_si"], p_btts_si_m, cuota_btts_si, sim["btts_si"])
-        agregar("Ambos Anotan (No)", metricas_base["btts_no"], p_btts_no_m, cuota_btts_no, sim["btts_no"])
+        agregar("Ambos Anotan (Sí)", metricas_base["btts_si"], p_btts_si_m, cuota_btts_si, casa_btts_si, casa_btts_si_p, sim["btts_si"])
+        agregar("Ambos Anotan (No)", metricas_base["btts_no"], p_btts_no_m, cuota_btts_no, casa_btts_no, casa_btts_no_p, sim["btts_no"])
         btts_market = {
             "disponible": True,
             "si": round(p_btts_si_m * 100.0, 1),
@@ -635,7 +680,9 @@ def simular_escenarios_con_pinnacle(
             "cuota_si": cuota_btts_si,
             "cuota_no": cuota_btts_no,
             "edge_si": round((metricas_base["btts_si"] / 100.0 - p_btts_si_m) * 100.0, 1),
-            "edge_no": round((metricas_base["btts_no"] / 100.0 - p_btts_no_m) * 100.0, 1)
+            "edge_no": round((metricas_base["btts_no"] / 100.0 - p_btts_no_m) * 100.0, 1),
+            "cuota_casa_si": casa_btts_si,
+            "cuota_casa_no": casa_btts_no
         }
     else:
         btts_market = {"disponible": False}
@@ -644,8 +691,11 @@ def simular_escenarios_con_pinnacle(
     recomendables = [m for m in mercados if m["accion"] in ("RECOMENDADO", "RECOMENDACIÓN CAUTELOSA")]
     recomendables.sort(key=lambda x: (x["score_valor"], x["ev"], x["edge"]), reverse=True)
 
-    # Candidatos: siempre se muestran para explicar por qué algo no entró.
-    candidatos = sorted(mercados, key=lambda x: (x["score_valor"], x["ev"], x["edge"]), reverse=True)
+    candidatos = sorted(
+        mercados,
+        key=lambda x: (x["score_valor"] is not None, x["score_valor"] if x["score_valor"] is not None else -999, x["ev"] if x["ev"] is not None else -999),
+        reverse=True
+    )
     top_3_candidatos = candidatos[:3]
     top_3_recomendaciones = recomendables[:3]
 
@@ -675,7 +725,7 @@ def simular_escenarios_con_pinnacle(
         "explicacion_recomendacion": explicacion_general,
         "confianza_modelo": round(confianza_ajuste * 100.0, 1),
         "rmse_calibracion_puntos_porcentuales": round(rmse_calibracion_pp, 2),
-        "modelo_metodo": "Poisson calibrado con 1X2 + Over/Under; ranking por EV + Edge + confianza; BTTS como validación independiente",
+        "modelo_metodo": "Poisson calibrado con Pinnacle (1X2 + Over/Under); 50k escenarios; ranking por EV + Edge + confianza usando la cuota de la casa donde se apuesta",
         "escenarios": total_escenarios
     }
 
@@ -694,7 +744,16 @@ def analizar_partido(
     cuota_mas_35_goles: float = 3.40,
     cuota_menos_35_goles: float = 1.32,
     cuota_btts_si: float = None,
-    cuota_btts_no: float = None
+    cuota_btts_no: float = None,
+    casa_local: float = None,
+    casa_empate: float = None,
+    casa_visitante: float = None,
+    casa_mas_25: float = None,
+    casa_menos_25: float = None,
+    casa_mas_35: float = None,
+    casa_menos_35: float = None,
+    casa_btts_si: float = None,
+    casa_btts_no: float = None
 ):
     try:
         sim = simular_escenarios_con_pinnacle(
@@ -702,7 +761,11 @@ def analizar_partido(
             cuota_mas_25_goles, cuota_menos_25_goles,
             cuota_mas_35_goles, cuota_menos_35_goles,
             cuota_btts_si=cuota_btts_si,
-            cuota_btts_no=cuota_btts_no
+            cuota_btts_no=cuota_btts_no,
+            casa_local=casa_local, casa_empate=casa_empate, casa_visitante=casa_visitante,
+            casa_mas_25=casa_mas_25, casa_menos_25=casa_menos_25,
+            casa_mas_35=casa_mas_35, casa_menos_35=casa_menos_35,
+            casa_btts_si=casa_btts_si, casa_btts_no=casa_btts_no
         )
 
         candidatos_top = [
@@ -735,6 +798,15 @@ def analizar_partido(
             "estado_recomendacion": sim["estado_recomendacion"],
             "explicacion_recomendacion": sim["explicacion_recomendacion"],
             "btts_referencia_pinnacle": sim["btts_referencia_pinnacle"],
+            "comparacion_casa_apuesta": {
+                "descripcion": "Pinnacle calibra el modelo; la cuota de la casa donde apuestas se usa para EV/valor.",
+                "cuotas_ingresadas": {
+                    "local": casa_local, "empate": casa_empate, "visitante": casa_visitante,
+                    "mas_25": casa_mas_25, "menos_25": casa_menos_25,
+                    "mas_35": casa_mas_35, "menos_35": casa_menos_35,
+                    "btts_si": casa_btts_si, "btts_no": casa_btts_no
+                }
+            },
             "modelo": {
                 "metodo": sim["modelo_metodo"],
                 "goles_esperados_local": sim["lambda_local"],
