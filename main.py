@@ -528,68 +528,154 @@ def simular_escenarios_con_pinnacle(
     }
 
     # ------------------------------------------
-    # EDGE / VALOR CRUZADO
+    # RANKING MATEMATICAMENTE CORRECTO: PROBABILIDAD + EV + CONFIANZA
     # ------------------------------------------
+    # Regla central:
+    #   EV = (P_modelo * cuota) - 1
+    #   Edge = P_modelo - P_mercado_sin_margen
+    # Una probabilidad alta por sí sola NO es una recomendación.
+    # Si no hay valor esperado suficiente, el sistema devuelve NO RECOMENDACIÓN.
+
     mercados = []
 
-    def agregar(nombre, prob_modelo, prob_mercado, cuota):
+    # Medimos qué tan bien encaja el modelo de goles con los mercados usados
+    # para calibrarlo. Menor error = mayor confianza estructural.
+    rmse_calibracion_pp = math.sqrt(max(error_calibracion, 0.0) / 5.0) * 100.0
+    confianza_ajuste = max(0.45, min(1.0, 1.0 - (rmse_calibracion_pp / 10.0)))
+
+    def agregar(nombre, prob_modelo, prob_mercado, cuota, prob_simulada=None):
         if cuota is None or cuota <= 1.0:
             return
-        edge = prob_modelo - (prob_mercado * 100.0)
-        # El score premia probabilidad alta, pero exige respaldo de edge.
-        # Un edge negativo se penaliza para que no domine el Top 3.
-        edge_pos = max(0.0, edge)
-        penalizacion = max(0.0, -edge)
-        score = (prob_modelo / 100.0) * (1.0 + 4.0 * edge_pos / 100.0) - 1.5 * (penalizacion / 100.0)
+
+        # Para el ranking usamos la probabilidad analítica del modelo, no el
+        # ruido de muestreo de las 50k simulaciones. La simulación sigue siendo
+        # el motor de comprobación y se muestra al usuario.
+        p_modelo = max(0.0, min(1.0, prob_modelo / 100.0))
+        p_mercado = max(0.0, min(1.0, prob_mercado))
+        edge = (p_modelo - p_mercado) * 100.0
+        ev = (p_modelo * cuota - 1.0) * 100.0
+
+        # Acuerdo entre la simulación y la probabilidad analítica.
+        if prob_simulada is None:
+            confianza_sim = 1.0
+        else:
+            diferencia_sim_pp = abs(float(prob_simulada) - float(prob_modelo))
+            confianza_sim = max(0.75, min(1.0, 1.0 - diferencia_sim_pp / 5.0))
+
+        confianza = max(0.0, min(1.0, confianza_ajuste * confianza_sim))
+        score_valor = ev * confianza
+
+        if ev >= 5.0 and edge >= 3.0:
+            nivel = "VALOR FUERTE"
+            accion = "RECOMENDADO"
+        elif ev >= 3.0 and edge >= 1.5:
+            nivel = "VALOR BUENO"
+            accion = "RECOMENDADO"
+        elif ev >= 1.5 and edge >= 1.0:
+            nivel = "VALOR LEVE"
+            accion = "RECOMENDACIÓN CAUTELOSA"
+        else:
+            nivel = "SIN VALOR SUFICIENTE"
+            accion = "NO RECOMENDADO"
+
+        if ev <= 0:
+            explicacion = (
+                f"El modelo estima {prob_modelo:.1f}% y la cuota {cuota:.2f} "
+                f"no compensa el riesgo (EV {ev:+.1f}%)."
+            )
+        elif edge < 1.0:
+            explicacion = (
+                f"Hay probabilidad favorable ({prob_modelo:.1f}%), pero la ventaja "
+                f"frente al mercado es demasiado pequeña (edge {edge:+.1f}%)."
+            )
+        elif ev < 1.5:
+            explicacion = (
+                f"Existe una pequeña ventaja estadística (edge {edge:+.1f}%), "
+                f"pero el valor esperado es insuficiente (EV {ev:+.1f}%)."
+            )
+        else:
+            explicacion = (
+                f"El modelo estima {prob_modelo:.1f}% frente a {p_mercado*100:.1f}% "
+                f"del mercado sin margen: edge {edge:+.1f}% y EV {ev:+.1f}%."
+            )
+
         mercados.append({
             "nombre": nombre,
             "probabilidad": round(prob_modelo, 1),
-            "probabilidad_mercado": round(prob_mercado * 100.0, 1),
+            "probabilidad_simulada": round(float(prob_simulada), 1) if prob_simulada is not None else round(prob_modelo, 1),
+            "probabilidad_mercado": round(p_mercado * 100.0, 1),
             "edge": round(edge, 1),
             "cuota": cuota,
-            "score": round(score, 4)
+            "ev": round(ev, 2),
+            "confianza": round(confianza * 100.0, 1),
+            "score_valor": round(score_valor, 2),
+            "nivel": nivel,
+            "accion": accion,
+            "explicacion": explicacion
         })
 
-    agregar("Victoria Local (1)", sim["p_1"], p_local_real, cuota_local)
-    agregar("Empate (X)", sim["p_x"], p_empate_real, cuota_empate)
-    agregar("Victoria Visitante (2)", sim["p_2"], p_visitante_real, cuota_visitante)
-    agregar("Más de 2.5 Goles", sim["over_25"], prob_over_25_base, cuota_mas_25)
-    agregar("Menos de 2.5 Goles", sim["under_25"], prob_under_25_base, cuota_menos_25)
-    agregar("Más de 3.5 Goles", sim["over_35"], prob_over_35_base, cuota_mas_35)
-    agregar("Menos de 3.5 Goles", sim["under_35"], prob_under_35_base, cuota_menos_35)
+    # Probabilidades analíticas para que el Top no dependa del azar de las 50k.
+    agregar("Victoria Local (1)", metricas_base["p_1"], p_local_real, cuota_local, sim["p_1"])
+    agregar("Empate (X)", metricas_base["p_x"], p_empate_real, cuota_empate, sim["p_x"])
+    agregar("Victoria Visitante (2)", metricas_base["p_2"], p_visitante_real, cuota_visitante, sim["p_2"])
+    agregar("Más de 2.5 Goles", metricas_base["over_25"], prob_over_25_base, cuota_mas_25, sim["over_25"])
+    agregar("Menos de 2.5 Goles", metricas_base["under_25"], prob_under_25_base, cuota_menos_25, sim["under_25"])
+    agregar("Más de 3.5 Goles", metricas_base["over_35"], prob_over_35_base, cuota_mas_35, sim["over_35"])
+    agregar("Menos de 3.5 Goles", metricas_base["under_35"], prob_under_35_base, cuota_menos_35, sim["under_35"])
 
     btts_disponible = cuota_btts_si is not None and cuota_btts_no is not None and cuota_btts_si > 1 and cuota_btts_no > 1
     if btts_disponible:
         p_btts_si_m, p_btts_no_m = _ajustar_probabilidades_cuota(cuota_btts_si, cuota_btts_no)
-        agregar("Ambos Anotan (Sí)", sim["btts_si"], p_btts_si_m, cuota_btts_si)
-        agregar("Ambos Anotan (No)", sim["btts_no"], p_btts_no_m, cuota_btts_no)
+        agregar("Ambos Anotan (Sí)", metricas_base["btts_si"], p_btts_si_m, cuota_btts_si, sim["btts_si"])
+        agregar("Ambos Anotan (No)", metricas_base["btts_no"], p_btts_no_m, cuota_btts_no, sim["btts_no"])
         btts_market = {
+            "disponible": True,
             "si": round(p_btts_si_m * 100.0, 1),
             "no": round(p_btts_no_m * 100.0, 1),
             "cuota_si": cuota_btts_si,
             "cuota_no": cuota_btts_no,
-            "edge_si": round(sim["btts_si"] - p_btts_si_m * 100.0, 1),
-            "edge_no": round(sim["btts_no"] - p_btts_no_m * 100.0, 1)
+            "edge_si": round((metricas_base["btts_si"] / 100.0 - p_btts_si_m) * 100.0, 1),
+            "edge_no": round((metricas_base["btts_no"] / 100.0 - p_btts_no_m) * 100.0, 1)
         }
     else:
         btts_market = {"disponible": False}
 
-    # Si no existe valor positivo, no inventamos una ventaja.
-    positivos = [m for m in mercados if m["edge"] > 0.5]
-    if len(positivos) >= 3:
-        ranking = sorted(positivos, key=lambda x: (x["score"], x["probabilidad"]), reverse=True)
+    # Solo llamamos RECOMENDACIÓN a mercados que superan los mínimos de valor.
+    recomendables = [m for m in mercados if m["accion"] in ("RECOMENDADO", "RECOMENDACIÓN CAUTELOSA")]
+    recomendables.sort(key=lambda x: (x["score_valor"], x["ev"], x["edge"]), reverse=True)
+
+    # Candidatos: siempre se muestran para explicar por qué algo no entró.
+    candidatos = sorted(mercados, key=lambda x: (x["score_valor"], x["ev"], x["edge"]), reverse=True)
+    top_3_candidatos = candidatos[:3]
+    top_3_recomendaciones = recomendables[:3]
+
+    if top_3_recomendaciones:
+        estado_recomendacion = "HAY VALOR DETECTADO"
+        explicacion_general = (
+            "El Top 3 solo incluye mercados que superan simultáneamente los mínimos "
+            "de Edge y Valor Esperado (EV). Los demás quedan como candidatos, no como apuestas recomendadas."
+        )
     else:
-        ranking = sorted(mercados, key=lambda x: (x["score"], x["probabilidad"]), reverse=True)
+        estado_recomendacion = "NO RECOMENDACIÓN"
+        explicacion_general = (
+            "Ningún mercado superó los mínimos estadísticos de Edge y Valor Esperado. "
+            "El sistema no fuerza un Top 3: cuando la ventaja no es suficiente, recomienda NO APOSTAR."
+        )
 
     return {
         **sim,
         "lambda_local": round(lambda_local, 3),
         "lambda_visitante": round(lambda_visitante, 3),
         "error_calibracion": round(error_calibracion, 5),
-        "mercados_valor": ranking[:9],
-        "top_3_detallado": ranking[:3],
+        "mercados_valor": candidatos[:9],
+        "top_3_detallado": top_3_recomendaciones,
+        "top_3_candidatos": top_3_candidatos,
         "btts_referencia_pinnacle": btts_market,
-        "modelo_metodo": "Poisson calibrado con 1X2 + Over/Under; BTTS como validación independiente",
+        "estado_recomendacion": estado_recomendacion,
+        "explicacion_recomendacion": explicacion_general,
+        "confianza_modelo": round(confianza_ajuste * 100.0, 1),
+        "rmse_calibracion_puntos_porcentuales": round(rmse_calibracion_pp, 2),
+        "modelo_metodo": "Poisson calibrado con 1X2 + Over/Under; ranking por EV + Edge + confianza; BTTS como validación independiente",
         "escenarios": total_escenarios
     }
 
@@ -620,9 +706,11 @@ def analizar_partido(
         )
 
         candidatos_top = [
-            f"{m['nombre']}: {m['probabilidad']}% | Edge {m['edge']:+.1f}%"
+            f"{m['nombre']}: {m['probabilidad']}% | Cuota {m['cuota']:.2f} | EV {m['ev']:+.1f}% | {m['nivel']}"
             for m in sim["top_3_detallado"]
         ]
+        if not candidatos_top:
+            candidatos_top = ["NO RECOMENDACIÓN: ningún mercado superó los mínimos de valor esperado y edge."]
 
         return {
             "aviso_legal_licencia": "NOTA: Análisis matemático estocástico avanzado de 50,000 iteraciones. No constituye garantía de resultado.",
@@ -642,13 +730,18 @@ def analizar_partido(
             },
             "top_3_recomendaciones": candidatos_top,
             "top_3_detallado": sim["top_3_detallado"],
+            "top_3_candidatos": sim["top_3_candidatos"],
             "mercados_valor": sim["mercados_valor"],
+            "estado_recomendacion": sim["estado_recomendacion"],
+            "explicacion_recomendacion": sim["explicacion_recomendacion"],
             "btts_referencia_pinnacle": sim["btts_referencia_pinnacle"],
             "modelo": {
                 "metodo": sim["modelo_metodo"],
                 "goles_esperados_local": sim["lambda_local"],
                 "goles_esperados_visitante": sim["lambda_visitante"],
-                "error_calibracion": sim["error_calibracion"]
+                "error_calibracion": sim["error_calibracion"],
+                "confianza_modelo": sim["confianza_modelo"],
+                "rmse_calibracion_puntos_porcentuales": sim["rmse_calibracion_puntos_porcentuales"]
             },
             "estado": "Simulación completada con éxito (50k escenarios + Poisson calibrado)"
         }
