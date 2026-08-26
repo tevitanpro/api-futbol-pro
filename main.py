@@ -6,13 +6,178 @@ import math
 import bisect
 from concurrent.futures import ThreadPoolExecutor
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+import os
+import secrets
+import hashlib
+import hmac
+import json
+import smtplib
+from email.message import EmailMessage
+from fastapi import Request
 
 app = FastAPI(
     title="API Master Pro - Pinnacle Optimized Edition",
     description="Motor de simulación matemática avanzada de 50,000 escenarios con base de datos e historial",
-    version="8.3.0"
+    version="8.6.0"
 )
+
+# ==========================================
+# CONFIGURACIÓN COMERCIAL Y SEGURIDAD v8.5
+# ==========================================
+FREE_HISTORY_LIMIT = 10
+PREMIUM_HISTORY_LIMIT = 100
+SESSION_DAYS = 7
+ADMIN_EMAIL = os.getenv("API_MASTER_ADMIN_EMAIL", "")
+ADMIN_PASSWORD = os.getenv("API_MASTER_ADMIN_PASSWORD", "")
+WOMPI_PUBLIC_KEY = os.getenv("WOMPI_PUBLIC_KEY", "")
+WOMPI_INTEGRITY_SECRET = os.getenv("WOMPI_INTEGRITY_SECRET", "")
+WOMPI_EVENT_SECRET = os.getenv("WOMPI_EVENT_SECRET", "")
+WOMPI_ENV = os.getenv("WOMPI_ENV", "test")
+IVA_RATE = float(os.getenv("IVA_RATE", "0.19"))
+APPLY_IVA = os.getenv("APPLY_IVA", "1") == "1"
+PLANS = {
+    "1_mes": {"name": "1 mes", "days": 30, "base": 12000},
+    "3_meses": {"name": "3 meses", "days": 90, "base": 35000},
+    "12_meses": {"name": "1 año", "days": 365, "base": 100000},
+}
+
+def _password_hash(password: str) -> str:
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 240000)
+    return "pbkdf2$240000$" + salt.hex() + "$" + digest.hex()
+
+def _password_verify(password: str, stored: str) -> bool:
+    if not stored:
+        return False
+    if stored.startswith("pbkdf2$"):
+        try:
+            _, rounds, salt_hex, digest_hex = stored.split("$", 3)
+            digest = hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt_hex), int(rounds))
+            return hmac.compare_digest(digest.hex(), digest_hex)
+        except Exception:
+            return False
+    # Compatibilidad temporal con cuentas antiguas en texto plano; se migra al iniciar sesión.
+    return hmac.compare_digest(password, stored)
+
+def _new_session() -> str:
+    return secrets.token_urlsafe(48)
+
+def _db():
+    conn = sqlite3.connect("database.db")
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def _send_email(to_email: str, subject: str, body: str):
+    host = os.getenv("SMTP_HOST")
+    port = int(os.getenv("SMTP_PORT", "587"))
+    user = os.getenv("SMTP_USER")
+    password = os.getenv("SMTP_PASSWORD")
+    sender = os.getenv("SMTP_FROM", user or "")
+    if not (host and user and password and sender and to_email):
+        return False
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = sender
+    msg["To"] = to_email
+    msg.set_content(body)
+    with smtplib.SMTP(host, port, timeout=15) as smtp:
+        smtp.starttls()
+        smtp.login(user, password)
+        smtp.send_message(msg)
+    return True
+
+def _plan_amount(plan_id: str):
+    plan = PLANS.get(plan_id)
+    if not plan:
+        raise HTTPException(status_code=400, detail="Plan no válido.")
+    base = plan["base"]
+    tax = round(base * IVA_RATE) if APPLY_IVA else 0
+    return base + tax, base, tax
+
+def _activate_plan_by_username(usuario: str, plan_id: str):
+    if plan_id not in PLANS:
+        raise HTTPException(status_code=400, detail="Plan no válido.")
+    conn = _db()
+    row = conn.execute("SELECT id, correo, plan, fecha_expiracion FROM usuarios WHERE usuario=?", (usuario,)).fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Usuario no encontrado.")
+    now = datetime.now()
+    current_exp = None
+    if row["fecha_expiracion"]:
+        try:
+            current_exp = datetime.fromisoformat(row["fecha_expiracion"])
+        except Exception:
+            current_exp = None
+    start = current_exp if current_exp and current_exp > now else now
+    expiration = start + timedelta(days=PLANS[plan_id]["days"])
+    conn.execute("UPDATE usuarios SET plan=?, fecha_expiracion=? WHERE usuario=?", (plan_id, expiration.strftime("%Y-%m-%d %H:%M:%S"), usuario))
+    conn.commit(); conn.close()
+    return expiration
+
+def _get_user_from_token(token: str):
+    if not token:
+        return None
+    conn = _db()
+    row = conn.execute("SELECT u.id,u.usuario,u.correo,u.plan,u.fecha_expiracion,s.expires_at FROM sesiones s JOIN usuarios u ON u.id=s.usuario_id WHERE s.token=?", (token,)).fetchone()
+    if not row:
+        conn.close(); return None
+    try:
+        exp = datetime.fromisoformat(row["expires_at"])
+    except Exception:
+        exp = datetime.min
+    if exp <= datetime.now():
+        conn.execute("DELETE FROM sesiones WHERE token=?", (token,)); conn.commit(); conn.close(); return None
+    if row["fecha_expiracion"]:
+        try:
+            if datetime.fromisoformat(row["fecha_expiracion"]) <= datetime.now():
+                conn.execute("UPDATE usuarios SET plan='gratis' WHERE id=?", (row["id"],)); conn.commit()
+                plan='gratis'
+            else:
+                plan=row["plan"]
+        except Exception: plan=row["plan"]
+    else: plan=row["plan"]
+    conn.close()
+    return {"id": row["id"], "usuario": row["usuario"], "correo": row["correo"], "plan": plan, "fecha_expiracion": row["fecha_expiracion"]}
+
+def _optional_user(request: Request):
+    auth = request.headers.get("Authorization", "")
+    token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+    return _get_user_from_token(token) if token else None
+
+def _history_count(usuario: str) -> int:
+    conn = _db()
+    row = conn.execute("SELECT COUNT(*) AS c FROM historial WHERE usuario=?", (usuario,)).fetchone()
+    conn.close()
+    return int(row["c"] or 0)
+
+def _save_analysis_if_allowed(user, partido_resumen: str, datos: dict):
+    if not user:
+        return {"guardado": False, "motivo": "invitado"}
+    limite = PREMIUM_HISTORY_LIMIT if user["plan"] in PLANS or user["usuario"] == ADMIN_EMAIL else FREE_HISTORY_LIMIT
+    usados = _history_count(user["usuario"])
+    if usados >= limite:
+        return {"guardado": False, "motivo": "limite_historial", "usados": usados, "limite": limite, "restantes": 0}
+    conn = _db()
+    conn.execute("INSERT INTO historial(usuario,fecha,partido_resumen,datos_json) VALUES(?,?,?,?)", (user["usuario"], datetime.now().strftime("%Y-%m-%d %H:%M:%S"), partido_resumen, json.dumps(datos, ensure_ascii=False)))
+    conn.commit(); conn.close()
+    usados += 1
+    return {"guardado": True, "usados": usados, "limite": limite, "restantes": max(0, limite-usados)}
+
+def _current_user(request: Request):
+    auth = request.headers.get("Authorization", "")
+    token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+    user = _get_user_from_token(token)
+    if not user:
+        raise HTTPException(status_code=401, detail="Sesión inválida o expirada.")
+    return user
+
+def _require_premium(request: Request):
+    user = _current_user(request)
+    if user["plan"] not in PLANS and user["usuario"] != ADMIN_EMAIL:
+        raise HTTPException(status_code=402, detail="JackBusca requiere un plan activo.")
+    return user
 
 # Configuración de CORS
 app.add_middleware(
@@ -53,6 +218,12 @@ def inicializar_db():
             datos_json TEXT NOT NULL
         )
     """)
+    cursor.execute("CREATE TABLE IF NOT EXISTS sesiones (token TEXT PRIMARY KEY, usuario_id INTEGER NOT NULL, creado_en TEXT NOT NULL, expires_at TEXT NOT NULL, FOREIGN KEY(usuario_id) REFERENCES usuarios(id))")
+    cursor.execute("""CREATE TABLE IF NOT EXISTS pagos (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, referencia TEXT UNIQUE NOT NULL, usuario TEXT NOT NULL, plan TEXT NOT NULL,
+        monto INTEGER NOT NULL, moneda TEXT NOT NULL DEFAULT 'COP', estado TEXT NOT NULL DEFAULT 'PENDING',
+        wompi_id TEXT, creado_en TEXT NOT NULL, actualizado_en TEXT NOT NULL
+    )""")
     conn.commit()
     conn.close()
 
@@ -82,115 +253,145 @@ class GuardarHistorialSchema(BaseModel):
 # ==========================================
 @app.post("/auth/register")
 def registrar_usuario(data: RegistroSchema):
-    conn = sqlite3.connect("database.db")
-    cursor = conn.cursor()
+    if len(data.password) < 8:
+        raise HTTPException(status_code=400, detail="La contraseña debe tener al menos 8 caracteres.")
+    conn = _db()
     try:
-        # La cuenta se crea gratis sin fecha de expiración forzosa inicial (o plan 'gratis')
-        cursor.execute(
-            "INSERT INTO usuarios (usuario, correo, password, plan) VALUES (?, ?, ?, ?)",
-            (data.usuario, data.correo, data.password, 'gratis')
-        )
+        conn.execute("INSERT INTO usuarios (usuario, correo, password, plan) VALUES (?, ?, ?, ?)", (data.usuario.strip(), data.correo.strip().lower(), _password_hash(data.password), 'gratis'))
         conn.commit()
-        return {
-            "mensaje": "¡Cuenta creada con éxito! Ya puedes ver tu historial.",
-            "usuario": data.usuario,
-            "correo": data.correo
-        }
+        return {"mensaje": "Cuenta creada con éxito.", "usuario": data.usuario.strip(), "correo": data.correo.strip().lower(), "plan": "gratis"}
     except sqlite3.IntegrityError:
-        raise HTTPException(status_code=400, detail="El nombre de usuario o el correo electrónico ya se encuentran registrados.")
+        raise HTTPException(status_code=400, detail="El nombre de usuario o el correo ya están registrados.")
     finally:
         conn.close()
 
 @app.post("/auth/login")
 def login_usuario(data: LoginSchema):
-    conn = sqlite3.connect("database.db")
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, correo, plan, fecha_expiracion FROM usuarios WHERE usuario = ? AND password = ?", (data.usuario, data.password))
-    user = cursor.fetchone()
+    conn = _db()
+    row = conn.execute("SELECT id, usuario, correo, password, plan, fecha_expiracion FROM usuarios WHERE usuario = ?", (data.usuario.strip(),)).fetchone()
+    if not row or not _password_verify(data.password, row["password"]):
+        conn.close(); raise HTTPException(status_code=401, detail="Usuario o contraseña incorrectos.")
+    if not row["password"].startswith("pbkdf2$"):
+        conn.execute("UPDATE usuarios SET password=? WHERE id=?", (_password_hash(data.password), row["id"]))
+    token = _new_session(); now=datetime.now(); exp=now+timedelta(days=SESSION_DAYS)
+    conn.execute("INSERT INTO sesiones(token,usuario_id,creado_en,expires_at) VALUES(?,?,?,?)", (token,row["id"],now.isoformat(),exp.isoformat()))
+    conn.commit(); conn.close()
+    return {"mensaje":"Login exitoso","token":token,"usuario":row["usuario"],"correo":row["correo"],"plan":row["plan"],"fecha_expiracion":row["fecha_expiracion"]}
+
+@app.post("/auth/logout")
+def logout_usuario(request: Request):
+    auth=request.headers.get("Authorization",""); token=auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+    conn=_db(); conn.execute("DELETE FROM sesiones WHERE token=?",(token,)); conn.commit(); conn.close()
+    return {"mensaje":"Sesión cerrada."}
+
+@app.get("/auth/me")
+def auth_me(user=Depends(_current_user)):
+    return user
+
+# ==========================================
+# COMERCIAL / PLANES / WOMPI
+# ==========================================
+@app.get("/planes")
+def listar_planes():
+    salida={}
+    for pid,p in PLANS.items():
+        total,base,tax=_plan_amount(pid)
+        salida[pid]={"nombre":p["name"],"dias":p["days"],"precio_base":base,"iva":tax,"precio_total":total,"iva_aplicado":APPLY_IVA}
+    return {"planes":salida,"moneda":"COP"}
+
+@app.post("/suscripcion/checkout")
+def crear_checkout(plan_id: str, request: Request, user=Depends(_current_user)):
+    if plan_id not in PLANS: raise HTTPException(status_code=400, detail="Plan no válido.")
+    if not WOMPI_PUBLIC_KEY or not WOMPI_INTEGRITY_SECRET:
+        raise HTTPException(status_code=503, detail="Wompi no está configurado en producción todavía.")
+    amount,_,_= _plan_amount(plan_id)
+    reference=f"AMP-{user['id']}-{secrets.token_hex(6).upper()}"
+    integrity=hashlib.sha256(f"{reference}{amount*100}COP{WOMPI_INTEGRITY_SECRET}".encode()).hexdigest()
+    now=datetime.now().isoformat()
+    conn=_db(); conn.execute("INSERT INTO pagos(referencia,usuario,plan,monto,moneda,estado,creado_en,actualizado_en) VALUES(?,?,?,?,?,?,?,?)",(reference,user['usuario'],plan_id,amount*100,'COP','PENDING',now,now)); conn.commit(); conn.close()
+    checkout_url="https://checkout.wompi.co/p/"
+    return {"reference":reference,"plan":plan_id,"amount_in_cents":amount*100,"currency":"COP","public_key":WOMPI_PUBLIC_KEY,"integrity_signature":integrity,"checkout_url":checkout_url,"mensaje":"El plan se activa únicamente cuando Wompi confirme APPROVED mediante webhook."}
+
+@app.post("/wompi/webhook")
+async def wompi_webhook(request: Request):
+    body=await request.json()
+    if WOMPI_EVENT_SECRET:
+        sig=body.get("signature",{})
+        props=sig.get("properties",[])
+        timestamp=body.get("timestamp")
+        data=body.get("data",{})
+        def get_path(obj,path):
+            cur=obj
+            for part in path.split('.'):
+                if isinstance(cur,dict): cur=cur.get(part)
+                else: return None
+            return cur
+        values=[]
+        for prop in props:
+            val=get_path(data,prop)
+            if val is None: val=get_path(body,prop)
+            values.append(str(val if val is not None else ''))
+        payload=''.join(values)+str(timestamp)+WOMPI_EVENT_SECRET
+        expected=hashlib.sha256(payload.encode()).hexdigest()
+        received=request.headers.get('X-Event-Checksum') or sig.get('checksum','')
+        if not received or not hmac.compare_digest(expected,received):
+            raise HTTPException(status_code=401, detail="Firma Wompi inválida.")
+    event=body.get('event')
+    tx=body.get('data',{}).get('transaction',{})
+    reference=tx.get('reference')
+    status=tx.get('status')
+    if event=='transaction.updated' and reference:
+        conn=_db(); row=conn.execute("SELECT usuario,plan,monto,estado FROM pagos WHERE referencia=?",(reference,)).fetchone()
+        if row:
+            now=datetime.now().isoformat()
+            conn.execute("UPDATE pagos SET estado=?,wompi_id=?,actualizado_en=? WHERE referencia=?",(status,tx.get('id'),now,reference)); conn.commit(); conn.close()
+            if status=='APPROVED' and row['estado']!='APPROVED':
+                expiration=_activate_plan_by_username(row['usuario'],row['plan'])
+                # Notificación best-effort: no bloquea el webhook si SMTP no está configurado.
+                conn2=_db(); u=conn2.execute("SELECT correo FROM usuarios WHERE usuario=?",(row['usuario'],)).fetchone(); conn2.close()
+                if u:
+                    try: _send_email(u['correo'], 'API Master Pro: pago aprobado', f"Tu plan {row['plan']} está activo hasta {expiration.strftime('%Y-%m-%d')}.")
+                    except Exception: pass
+    return {"ok":True}
+
+@app.get("/admin/resumen")
+def admin_resumen(request: Request):
+    # El administrador se identifica por una cuenta ADMIN real, nunca por una clave maestra en HTML.
+    user=_current_user(request)
+    if not ADMIN_EMAIL or user['correo'].lower()!=ADMIN_EMAIL.lower():
+        raise HTTPException(status_code=403, detail="Acceso de administrador requerido.")
+    conn=_db()
+    usuarios=conn.execute("SELECT COUNT(*) c FROM usuarios").fetchone()['c']
+    premium=conn.execute("SELECT COUNT(*) c FROM usuarios WHERE plan != 'gratis'").fetchone()['c']
+    pagos=conn.execute("SELECT COUNT(*) c FROM pagos WHERE estado='APPROVED'").fetchone()['c']
+    pendientes=conn.execute("SELECT COUNT(*) c FROM pagos WHERE estado='PENDING'").fetchone()['c']
     conn.close()
-    
-    if not user:
-        raise HTTPException(status_code=401, detail="Usuario o contraseña incorrectos.")
-    
-    return {
-        "mensaje": "Login exitoso",
-        "usuario": data.usuario,
-        "correo": user[1],
-        "plan": user[2],
-        "fecha_expiracion": user[3]
-    }
+    return {"usuarios":usuarios,"premium":premium,"pagos_aprobados":pagos,"pagos_pendientes":pendientes}
 
 # ==========================================
-# CONTROL DE PAGOS Y PLANES (1 Mes: 12k, 3 Meses: 36k, 12 Meses: 100k)
+# RUTAS DE HISTORIAL
 # ==========================================
-@app.post("/suscripcion/activar")
-def activar_plan(data: ActivarPlanSchema):
-    conn = sqlite3.connect("database.db")
-    cursor = conn.cursor()
-    
-    cursor.execute("SELECT id FROM usuarios WHERE usuario = ?", (data.usuario,))
-    if not cursor.fetchone():
-        conn.close()
-        raise HTTPException(status_code=404, detail="Usuario no encontrado.")
-    
-    base_fecha = datetime.now()
-    if data.tipo_plan == '1_mes':
-        nueva_exp = base_fecha + timedelta(days=30)
-    elif data.tipo_plan == '3_meses':
-        nueva_exp = base_fecha + timedelta(days=90)
-    elif data.tipo_plan == '12_meses':
-        nueva_exp = base_fecha + timedelta(days=365)
-    else:
-        conn.close()
-        raise HTTPException(status_code=400, detail="Plan no válido.")
-
-    cursor.execute(
-        "UPDATE usuarios SET plan = ?, fecha_expiracion = ? WHERE usuario = ?",
-        (data.tipo_plan, nueva_exp.strftime("%Y-%m-%d %H:%M:%S"), data.usuario)
-    )
-    conn.commit()
-    conn.close()
-    
-    return {
-        "mensaje": f"Plan {data.tipo_plan} activado correctamente.",
-        "nueva_expiracion": nueva_exp.strftime("%Y-%m-%d")
-    }
-
-# ==========================================
-# RUTAS DE HISTORIAL (MÁXIMO LOS ÚLTIMOS 20 PARTIDOS)
 # ==========================================
 @app.post("/historial/guardar")
-def guardar_historial(data: GuardarHistorialSchema):
-    conn = sqlite3.connect("database.db")
-    cursor = conn.cursor()
-    fecha_actual = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    
-    # Guardamos la nueva búsqueda
-    cursor.execute(
-        "INSERT INTO historial (usuario, fecha, partido_resumen, datos_json) VALUES (?, ?, ?, ?)",
-        (data.usuario, fecha_actual, data.partido_resumen, data.datos_json)
-    )
-    conn.commit()
-    
-    # Opcional para mantener limpia la BD: conservar solo registros recientes si se desea, 
-    # pero el endpoint de lectura ya limita a los últimos 20.
-    conn.close()
-    return {"mensaje": "Análisis guardado con éxito"}
+def guardar_historial(data: GuardarHistorialSchema, user=Depends(_current_user)):
+    if data.usuario != user['usuario']:
+        raise HTTPException(status_code=403, detail="No puedes guardar historial de otro usuario.")
+    try:
+        payload = json.loads(data.datos_json) if data.datos_json else {}
+    except Exception:
+        payload = {"detalle": data.datos_json}
+    resultado = _save_analysis_if_allowed(user, data.partido_resumen, payload)
+    if not resultado.get("guardado"):
+        raise HTTPException(status_code=409, detail=f"Has alcanzado el límite de {resultado.get('limite', FREE_HISTORY_LIMIT)} análisis guardados para tu plan.")
+    return {"mensaje":"Análisis guardado con éxito.", "historial": resultado}
 
 @app.get("/historial/{usuario}")
-def ver_historial(usuario: str):
-    conn = sqlite3.connect("database.db")
-    cursor = conn.cursor()
-    # Limitamos estrictamente a los últimos 20 partidos buscados por el usuario
-    cursor.execute("SELECT fecha, partido_resumen, datos_json FROM historial WHERE usuario = ? ORDER BY id DESC LIMIT 20", (usuario,))
-    resultados = cursor.fetchall()
-    conn.close()
-    
-    historial_lista = [
-        {"fecha": r[0], "partido": r[1], "detalles": r[2]} for r in resultados
-    ]
-    return {"usuario": usuario, "historial": historial_lista}
-
+def ver_historial(usuario: str, request: Request, user=Depends(_current_user)):
+    if usuario != user['usuario']:
+        raise HTTPException(status_code=403, detail="No autorizado.")
+    limite = PREMIUM_HISTORY_LIMIT if user['plan'] in PLANS else FREE_HISTORY_LIMIT
+    conn=_db(); rows=conn.execute("SELECT fecha,partido_resumen,datos_json FROM historial WHERE usuario=? ORDER BY id DESC LIMIT ?",(usuario,limite)).fetchall(); conn.close()
+    return {"usuario":usuario,"limite":limite,"historial":[{"fecha":r['fecha'],"partido":r['partido_resumen'],"detalles":r['datos_json']} for r in rows]}
 
 # ==========================================
 # MOTOR DE SIMULACIÓN ESTOCÁSTICA (50k ESCENARIOS)
@@ -736,6 +937,7 @@ def home():
 # --- RUTA 1: FASE SUPERIOR ---
 @app.get("/analisis/partido")
 def analizar_partido(
+    request: Request,
     cuota_local: float = 3.03,
     cuota_empate: float = 3.26,
     cuota_visitante: float = 2.56,
@@ -774,6 +976,9 @@ def analizar_partido(
         ]
         if not candidatos_top:
             candidatos_top = ["NO RECOMENDACIÓN: ningún mercado superó los mínimos de valor esperado y edge."]
+
+        usuario_actual = _optional_user(request)
+        historial_info = _save_analysis_if_allowed(usuario_actual, "Motor Principal | Análisis de partido", sim)
 
         return {
             "aviso_legal_licencia": "NOTA: Análisis matemático estocástico avanzado de 50,000 iteraciones. No constituye garantía de resultado.",
@@ -815,7 +1020,8 @@ def analizar_partido(
                 "confianza_modelo": sim["confianza_modelo"],
                 "rmse_calibracion_puntos_porcentuales": sim["rmse_calibracion_puntos_porcentuales"]
             },
-            "estado": "Simulación completada con éxito (50k escenarios + Poisson calibrado)"
+            "estado": "Simulación completada con éxito (50k escenarios + Poisson calibrado)",
+            "historial_info": historial_info
         }
     except Exception as e:
         return {"error": f"Error en el servidor: {str(e)}"}
@@ -973,6 +1179,7 @@ def _evaluar_mercado_jack(nombre, prob_modelo, cuota_ref, cuota_casa, confianza,
 
 @app.get('/jackbusca/partido')
 def jackbusca_partido(
+    request: Request,
     promedio_tarjetas_arbitro: float = None,
     promedio_esperado_corners: float = None,
     # Pinnacle tarjetas: todas opcionales.
@@ -1008,6 +1215,7 @@ def jackbusca_partido(
     casa_corners_menos_105: float = None,
 ):
     try:
+        _require_premium(request)
         lineas_t = [
             (3.5, cuota_tarjetas_mas_35, cuota_tarjetas_menos_35),
             (4.5, cuota_tarjetas_mas_45, cuota_tarjetas_menos_45),
@@ -1079,6 +1287,13 @@ def jackbusca_partido(
         if not bloques:
             bloques.append('Datos suficientes para ambos bloques.')
 
+        usuario_actual = _optional_user(request)
+        historial_info = _save_analysis_if_allowed(
+            usuario_actual,
+            "JackBusca | Tarjetas y Córners",
+            {"arbitraje": {"lambda_tarjetas": lam_t, "fuente": fuente_t}, "corners": {"lambda_total": lam_c, "fuente": fuente_c}, "top_3_recomendaciones": recomendables[:3], "estado_recomendacion": 'HAY VALOR DETECTADO' if recomendables else 'NO RECOMENDACIÓN'}
+        )
+
         return {
             'origen': 'JackBusca v8.4 - modelo flexible de Tarjetas y Córners',
             'regla_datos': 'Los datos son opcionales; el motor nunca inventa cuotas ni promedios faltantes.',
@@ -1109,7 +1324,8 @@ def jackbusca_partido(
             'top_3_recomendaciones': recomendables[:3],
             'estado_recomendacion': 'HAY VALOR DETECTADO' if recomendables else 'NO RECOMENDACIÓN',
             'explicacion': ' '.join(bloques) + (' Si ninguna cuota de la casa fue introducida, se muestran probabilidades pero no se fuerza una recomendación de valor.' if mercados else ''),
-            'escenarios': 50000
+            'escenarios': 50000,
+            'historial_info': historial_info
         }
     except Exception as e:
         return {'error': f'Error en JackBusca: {str(e)}'}
