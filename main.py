@@ -340,7 +340,8 @@ def registrar_usuario(data: RegistroSchema):
     sent = False
     try:
         sent = _send_verification_email(email, usuario, token)
-    except Exception:
+    except Exception as e:
+        print(f"ERROR SMTP VERIFICACION: {type(e).__name__}: {e}", flush=True)
         sent = False
     response = {"mensaje":"Cuenta creada. Revisa tu correo para verificarla.", "usuario":usuario, "correo":email, "plan":"gratis", "email_verificado":False, "correo_enviado":sent}
     if DEV_SHOW_EMAIL_TOKENS and not sent:
