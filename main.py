@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends
+
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import random
@@ -863,6 +863,72 @@ def admin_resumen(user=Depends(_current_user)):
     return {"usuarios":usuarios,"premium":premium,"pagos_aprobados":pagos,"pagos_pendientes":pendientes}
 
 
+@app.get("/admin/usuarios")
+def admin_usuarios(buscar: str = "", user=Depends(_current_user)):
+    if not _is_admin(user):
+        raise HTTPException(status_code=403, detail="Acceso de administrador requerido.")
+    q = f"%{buscar.strip()}%"
+    conn = _db()
+    rows = conn.execute("""
+        SELECT u.id, u.usuario, u.correo, u.plan, u.fecha_expiracion,
+               u.activo, u.email_verificado,
+               (SELECT COUNT(*) FROM historial h WHERE h.usuario=u.usuario) AS historial_count,
+               (SELECT COUNT(*) FROM pagos p WHERE p.usuario=u.usuario AND p.estado='PENDING') AS pagos_pendientes
+        FROM usuarios u
+        WHERE u.usuario LIKE ? OR u.correo LIKE ?
+        ORDER BY u.id DESC
+        LIMIT 100
+    """, (q, q)).fetchall()
+    conn.close()
+    return {"usuarios": [dict(r) for r in rows]}
+
+@app.get("/admin/usuarios/{usuario}")
+def admin_detalle_usuario(usuario: str, user=Depends(_current_user)):
+    if not _is_admin(user):
+        raise HTTPException(status_code=403, detail="Acceso de administrador requerido.")
+    conn = _db()
+    row = conn.execute("""
+        SELECT id, usuario, correo, plan, fecha_expiracion, activo, email_verificado
+        FROM usuarios WHERE usuario=?
+    """, (usuario,)).fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Usuario no encontrado.")
+    pagos = conn.execute("""
+        SELECT referencia, plan, monto, moneda, estado, notas_admin, creado_en, actualizado_en
+        FROM pagos WHERE usuario=? ORDER BY id DESC LIMIT 25
+    """, (usuario,)).fetchall()
+    historial = conn.execute("""
+        SELECT id, fecha, partido_resumen FROM historial
+        WHERE usuario=? ORDER BY id DESC LIMIT 20
+    """, (usuario,)).fetchall()
+    conn.close()
+    return {
+        "usuario": dict(row),
+        "pagos": [dict(r) for r in pagos],
+        "historial": [dict(r) for r in historial]
+    }
+
+class AdminActivarPlanSchema(BaseModel):
+    tipo_plan: str
+    nota: str = ""
+
+@app.post("/admin/usuarios/{usuario}/activar")
+def admin_activar_plan(usuario: str, data: AdminActivarPlanSchema, user=Depends(_current_user)):
+    if not _is_admin(user):
+        raise HTTPException(status_code=403, detail="Acceso de administrador requerido.")
+    if data.tipo_plan not in PLANS:
+        raise HTTPException(status_code=400, detail="Plan no válido.")
+    expiration = _activate_plan_by_username(usuario, data.tipo_plan)
+    return {
+        "ok": True,
+        "mensaje": "Plan activado manualmente.",
+        "usuario": usuario,
+        "plan": data.tipo_plan,
+        "fecha_expiracion": expiration.strftime('%Y-%m-%d %H:%M:%S'),
+        "nota": data.nota.strip()
+    }
+
 @app.get("/admin/pagos")
 def admin_pagos(user=Depends(_current_user)):
     if not _is_admin(user):
@@ -872,36 +938,37 @@ def admin_pagos(user=Depends(_current_user)):
     conn.close()
     return {"pagos":[dict(r) for r in rows]}
 
+class AdminPagoSchema(BaseModel):
+    nota: str = ""
 
 @app.post("/admin/pagos/{pago_id}/aprobar")
 def admin_aprobar_pago(pago_id:int, data:AdminPagoSchema=None, user=Depends(_current_user)):
     if not _is_admin(user):
         raise HTTPException(status_code=403, detail="Acceso de administrador requerido.")
-    conn=_db()
-    row=conn.execute("SELECT id,usuario,plan,estado FROM pagos WHERE id=?",(pago_id,)).fetchone()
+    conn=_db(); row=conn.execute("SELECT id,usuario,plan,estado FROM pagos WHERE id=?",(pago_id,)).fetchone()
     if not row:
         conn.close(); raise HTTPException(status_code=404, detail="Pago no encontrado.")
     if row['estado']=='APPROVED':
         conn.close(); return {"ok":True,"mensaje":"El pago ya estaba aprobado."}
     nota=(data.nota if data else "").strip()
-    conn.execute("UPDATE pagos SET estado='APPROVED',notas_admin=?,actualizado_en=? WHERE id=?",(nota,datetime.now().isoformat(),pago_id))
+    now=datetime.now().isoformat()
+    conn.execute("UPDATE pagos SET estado='APPROVED',notas_admin=?,actualizado_en=? WHERE id=?",(nota,now,pago_id))
     conn.commit(); conn.close()
     expiration=_activate_plan_by_username(row['usuario'],row['plan'])
     return {"ok":True,"mensaje":"Pago aprobado y plan activado.","usuario":row['usuario'],"plan":row['plan'],"fecha_expiracion":expiration.strftime('%Y-%m-%d %H:%M:%S')}
-
 
 @app.post("/admin/pagos/{pago_id}/rechazar")
 def admin_rechazar_pago(pago_id:int, data:AdminPagoSchema=None, user=Depends(_current_user)):
     if not _is_admin(user):
         raise HTTPException(status_code=403, detail="Acceso de administrador requerido.")
-    conn=_db()
-    row=conn.execute("SELECT id FROM pagos WHERE id=?",(pago_id,)).fetchone()
+    nota=(data.nota if data else "").strip()
+    conn=_db(); row=conn.execute("SELECT id FROM pagos WHERE id=?",(pago_id,)).fetchone()
     if not row:
         conn.close(); raise HTTPException(status_code=404, detail="Pago no encontrado.")
-    nota=(data.nota if data else "").strip()
     conn.execute("UPDATE pagos SET estado='REJECTED',notas_admin=?,actualizado_en=? WHERE id=?",(nota,datetime.now().isoformat(),pago_id))
     conn.commit(); conn.close()
     return {"ok":True,"mensaje":"Pago rechazado."}
+
 
 
 # ==========================================
@@ -1591,6 +1658,8 @@ def analizar_partido(
             "estado": "Simulación completada con éxito (50k escenarios + Poisson calibrado)",
             "historial_info": historial_info
         }
+    except HTTPException:
+        raise
     except Exception as e:
         return {"error": f"Error en el servidor: {str(e)}"}
 
@@ -1895,6 +1964,8 @@ def jackbusca_partido(
             'escenarios': 50000,
             'historial_info': historial_info
         }
+    except HTTPException:
+        raise
     except Exception as e:
         return {'error': f'Error en JackBusca: {str(e)}'}
 
