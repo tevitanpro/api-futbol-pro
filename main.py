@@ -126,10 +126,13 @@ def _db():
 
 def _send_email(to_email: str, subject: str, body: str):
     api_key = os.getenv("RESEND_API_KEY")
-sender = RESEND_FROM_EMAIL
+    sender = RESEND_FROM_EMAIL
 
     if not api_key or not to_email or not sender:
-        print("RESEND ERROR: faltan RESEND_API_KEY, destinatario o remitente", flush=True)
+        print(
+            "RESEND ERROR: faltan RESEND_API_KEY, destinatario o remitente",
+            flush=True
+        )
         return False
 
     data = json.dumps({
@@ -151,17 +154,32 @@ sender = RESEND_FROM_EMAIL
 
     try:
         with urllib.request.urlopen(req, timeout=15) as response:
-            response_body = response.read().decode("utf-8", errors="replace")
-            print(f"RESEND OK: {response.status} {response_body}", flush=True)
+            response_body = response.read().decode(
+                "utf-8",
+                errors="replace"
+            )
+            print(
+                f"RESEND OK: {response.status} {response_body}",
+                flush=True
+            )
             return 200 <= response.status < 300
-   
+
     except urllib.error.HTTPError as e:
-        error_body = e.read().decode("utf-8", errors="replace")
-        print(f"RESEND ERROR: HTTP {e.code}: {error_body}", flush=True)
+        error_body = e.read().decode(
+            "utf-8",
+            errors="replace"
+        )
+        print(
+            f"RESEND ERROR: HTTP {e.code}: {error_body}",
+            flush=True
+        )
         return False
 
-except Exception as e:
-        print(f"RESEND ERROR: {type(e).__name__}: {e}", flush=True)
+    except Exception as e:
+        print(
+            f"RESEND ERROR: {type(e).__name__}: {e}",
+            flush=True
+        )
         return False
 def _plan_amount(plan_id: str):
     plan = PLANS.get(plan_id)
