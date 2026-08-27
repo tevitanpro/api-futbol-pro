@@ -431,7 +431,7 @@ def resetear_password(data: ResetPasswordSchema):
 @app.post("/auth/login")
 def login_usuario(data: LoginSchema):
     conn = _db()
-    row = conn.execute("SELECT id, usuario, correo, password, plan, fecha_expiracion, email_verificado, rol FROM usuarios WHERE usuario = ?", (data.usuario.strip(),)).fetchone()
+    row = conn.execute("SELECT id, usuario, correo, password, plan, fecha_expiracion,activo,email_verificado, rol FROM usuarios WHERE usuario = ?", (data.usuario.strip(),)).fetchone()
     if not row or not _password_verify(data.password, row["password"]):
         conn.close(); raise HTTPException(status_code=401, detail="Usuario o contraseña incorrectos.")
     if not row["activo"]:
