@@ -391,7 +391,7 @@ def registrar_usuario(data: RegistroSchema):
         sent = False
     response = {"mensaje":"Cuenta creada. Revisa tu correo para verificarla.", "usuario":usuario, "correo":email, "plan":"gratis", "email_verificado":False, "correo_enviado":sent}
     if DEV_SHOW_EMAIL_TOKENS and not sent:
-        response["dev_verification_link"] = APP_BASE_URL.rstrip('/') + '/?verify_email=' + token
+        response["dev_verification_link"] = APP_BASE_URL.rstrip('/') + '/auth/verify-email?token=' + token
     return response
 
 @app.get("/auth/verify-email")
@@ -487,7 +487,7 @@ def reenviar_verificacion(data: EmailSchema):
     except Exception:
         sent = False
     if DEV_SHOW_EMAIL_TOKENS and not sent:
-        response["dev_verification_link"] = APP_BASE_URL.rstrip('/') + '/?verify_email=' + token
+        response["dev_verification_link"] = APP_BASE_URL.rstrip('/') + '/auth/verify-email?token=' + token
     return response
 
 @app.post("/auth/forgot-password")
@@ -505,7 +505,7 @@ def solicitar_recuperacion(data: EmailSchema):
     except Exception:
         sent = False
     if DEV_SHOW_EMAIL_TOKENS and not sent:
-        response["dev_reset_link"] = APP_BASE_URL.rstrip('/') + '/?reset_password=' + token
+        response["dev_reset_link"] = APP_BASE_URL.rstrip('/') + '/auth/reset-password?token=' + token
     return response
 @app.get("/auth/reset-password", response_class=HTMLResponse)
 def mostrar_reset_password(token: str):
@@ -1398,7 +1398,14 @@ def simular_escenarios_con_pinnacle(
     }
 
 @app.get("/")
-def home():
+def home(verify_email: str = "", reset_password: str = ""):
+    # Compatibilidad con enlaces antiguos enviados antes del cambio de rutas.
+    # Así, si alguien abre /?verify_email=... o /?reset_password=...,
+    # recibe la misma pantalla estética en vez de la respuesta JSON de la API.
+    if verify_email:
+        return verificar_correo(verify_email)
+    if reset_password:
+        return mostrar_reset_password(reset_password)
     return {"mensaje": "API Master Pro - Motor Estocástico con Base de Datos e Historial Activo"}
 
 # --- RUTA 1: FASE SUPERIOR ---
@@ -1645,3 +1652,155 @@ def _evaluar_mercado_jack(nombre, prob_modelo, cuota_ref, cuota_casa, confianza,
 
 
 @app.get('/jackbusca/partido')
+def jackbusca_partido(
+    request: Request,
+    promedio_tarjetas_arbitro: float = None,
+    promedio_esperado_corners: float = None,
+    # Pinnacle tarjetas: todas opcionales.
+    cuota_tarjetas_mas_35: float = None,
+    cuota_tarjetas_menos_35: float = None,
+    cuota_tarjetas_mas_45: float = None,
+    cuota_tarjetas_menos_45: float = None,
+    cuota_tarjetas_mas_55: float = None,
+    cuota_tarjetas_menos_55: float = None,
+    # Pinnacle córners: todas opcionales.
+    cuota_corners_mas_75: float = None,
+    cuota_corners_menos_75: float = None,
+    cuota_corners_mas_85: float = None,
+    cuota_corners_menos_85: float = None,
+    cuota_corners_mas_95: float = None,
+    cuota_corners_menos_95: float = None,
+    cuota_corners_mas_105: float = None,
+    cuota_corners_menos_105: float = None,
+    # Cuotas de la casa donde apuesta el usuario: opcionales.
+    casa_tarjetas_mas_35: float = None,
+    casa_tarjetas_menos_35: float = None,
+    casa_tarjetas_mas_45: float = None,
+    casa_tarjetas_menos_45: float = None,
+    casa_tarjetas_mas_55: float = None,
+    casa_tarjetas_menos_55: float = None,
+    casa_corners_mas_75: float = None,
+    casa_corners_menos_75: float = None,
+    casa_corners_mas_85: float = None,
+    casa_corners_menos_85: float = None,
+    casa_corners_mas_95: float = None,
+    casa_corners_menos_95: float = None,
+    casa_corners_mas_105: float = None,
+    casa_corners_menos_105: float = None,
+):
+    try:
+        _require_premium(request)
+        lineas_t = [
+            (3.5, cuota_tarjetas_mas_35, cuota_tarjetas_menos_35),
+            (4.5, cuota_tarjetas_mas_45, cuota_tarjetas_menos_45),
+            (5.5, cuota_tarjetas_mas_55, cuota_tarjetas_menos_55),
+        ]
+        lineas_c = [
+            (7.5, cuota_corners_mas_75, cuota_corners_menos_75),
+            (8.5, cuota_corners_mas_85, cuota_corners_menos_85),
+            (9.5, cuota_corners_mas_95, cuota_corners_menos_95),
+            (10.5, cuota_corners_mas_105, cuota_corners_menos_105),
+        ]
+
+        lam_t, conf_t, fuente_t = _lambda_tarjetas(promedio_tarjetas_arbitro, lineas_t)
+        lam_c, err_c, n_c = _lambda_corners_desde_mercado(lineas_c)
+
+        # Si el usuario aporta promedio de córners, se puede usar como señal secundaria,
+        # pero nunca es obligatorio. El mercado sigue teniendo prioridad si existe.
+        if lam_c is not None and promedio_esperado_corners is not None and promedio_esperado_corners > 0:
+            lam_c = 0.75 * lam_c + 0.25 * float(promedio_esperado_corners)
+            fuente_c = 'MERCADO O/U + PROMEDIO'
+        elif lam_c is not None:
+            fuente_c = 'MERCADO O/U'
+        elif promedio_esperado_corners is not None and promedio_esperado_corners > 0:
+            lam_c = float(promedio_esperado_corners)
+            err_c = None
+            fuente_c = 'PROMEDIO APORTADO'
+        else:
+            fuente_c = 'SIN DATOS'
+
+        lineas = [3.5, 4.5, 5.5]
+        tarjetas_mas = tarjetas_menos = {}
+        if lam_t is not None:
+            tarjetas_mas, tarjetas_menos = _probabilidades_con_lambda_total(lam_t, lineas)
+
+        corners_lineas = [7.5, 8.5, 9.5, 10.5]
+        corners_mas = corners_menos = {}
+        if lam_c is not None:
+            corners_mas, corners_menos = _probabilidades_con_lambda_total(lam_c, corners_lineas)
+
+        mercados = []
+        if lam_t is not None:
+            for linea, over, under, casa_o, casa_u in [
+                (3.5, cuota_tarjetas_mas_35, cuota_tarjetas_menos_35, casa_tarjetas_mas_35, casa_tarjetas_menos_35),
+                (4.5, cuota_tarjetas_mas_45, cuota_tarjetas_menos_45, casa_tarjetas_mas_45, casa_tarjetas_menos_45),
+                (5.5, cuota_tarjetas_mas_55, cuota_tarjetas_menos_55, casa_tarjetas_mas_55, casa_tarjetas_menos_55),
+            ]:
+                mercados.append(_evaluar_mercado_jack(f'Más {linea} Tarjetas', tarjetas_mas[linea], over, casa_o, conf_t, f'Fuente: {fuente_t}.'))
+                mercados.append(_evaluar_mercado_jack(f'Menos {linea} Tarjetas', tarjetas_menos[linea], under, casa_u, conf_t, f'Fuente: {fuente_t}.'))
+
+        if lam_c is not None:
+            for linea, over, under, casa_o, casa_u in [
+                (7.5, cuota_corners_mas_75, cuota_corners_menos_75, casa_corners_mas_75, casa_corners_menos_75),
+                (8.5, cuota_corners_mas_85, cuota_corners_menos_85, casa_corners_mas_85, casa_corners_menos_85),
+                (9.5, cuota_corners_mas_95, cuota_corners_menos_95, casa_corners_mas_95, casa_corners_menos_95),
+                (10.5, cuota_corners_mas_105, cuota_corners_menos_105, casa_corners_mas_105, casa_corners_menos_105),
+            ]:
+                mercados.append(_evaluar_mercado_jack(f'Más {linea} Córners', corners_mas[linea], over, casa_o, 0.68 if n_c >= 3 else 0.58, f'Fuente: {fuente_c}.'))
+                mercados.append(_evaluar_mercado_jack(f'Menos {linea} Córners', corners_menos[linea], under, casa_u, 0.68 if n_c >= 3 else 0.58, f'Fuente: {fuente_c}.'))
+
+        mercados = [m for m in mercados if m]
+        recomendables = [m for m in mercados if m['accion'] in ('RECOMENDADO', 'RECOMENDACIÓN CAUTELOSA')]
+        recomendables.sort(key=lambda x: x.get('score_valor', -999), reverse=True)
+
+        bloques = []
+        if lam_t is None:
+            bloques.append('Tarjetas: DATOS INSUFICIENTES. Aporta promedio del árbitro o al menos una línea O/U completa de tarjetas.')
+        if lam_c is None:
+            bloques.append('Córners: DATOS INSUFICIENTES. No se inventó un promedio; aporta una línea O/U de Pinnacle o, si la conoces, una media de córners.')
+        if not bloques:
+            bloques.append('Datos suficientes para ambos bloques.')
+
+        usuario_actual = _optional_user(request)
+        historial_info = _save_analysis_if_allowed(
+            usuario_actual,
+            "JackBusca | Tarjetas y Córners",
+            {"arbitraje": {"lambda_tarjetas": lam_t, "fuente": fuente_t}, "corners": {"lambda_total": lam_c, "fuente": fuente_c}, "top_3_recomendaciones": recomendables[:3], "estado_recomendacion": 'HAY VALOR DETECTADO' if recomendables else 'NO RECOMENDACIÓN'}
+        )
+
+        return {
+            'origen': 'JackBusca v8.4 - modelo flexible de Tarjetas y Córners',
+            'regla_datos': 'Los datos son opcionales; el motor nunca inventa cuotas ni promedios faltantes.',
+            'arbitraje': {
+                'promedio_tarjetas_referencia': promedio_tarjetas_arbitro,
+                'lambda_tarjetas': round(lam_t, 3) if lam_t is not None else None,
+                'fuente': fuente_t,
+                'confianza': round(conf_t * 100.0, 1)
+            },
+            'corners': {
+                'promedio_aportado': promedio_esperado_corners,
+                'lambda_total': round(lam_c, 3) if lam_c is not None else None,
+                'lineas_pinnacle_disponibles': n_c,
+                'fuente': fuente_c,
+                'error_calibracion': round(err_c, 5) if err_c is not None else None,
+                'confianza': round((0.68 if n_c >= 3 else 0.58) * 100.0, 1) if lam_c is not None else 0.0
+            },
+            'mercados_tarjetas_explicados': ({
+                f'mas_de_{x}': f'{tarjetas_mas[x]}%' for x in lineas
+            } | {
+                f'menos_de_{x}': f'{tarjetas_menos[x]}%' for x in lineas
+            }) if lam_t is not None else {},
+            'mercados_tiros_de_esquina': {
+                'mas_de': {str(x): f'{corners_mas[x]}%' for x in corners_lineas} if lam_c is not None else {},
+                'menos_de': {str(x): f'{corners_menos[x]}%' for x in corners_lineas} if lam_c is not None else {}
+            },
+            'mercados_valor': mercados,
+            'top_3_recomendaciones': recomendables[:3],
+            'estado_recomendacion': 'HAY VALOR DETECTADO' if recomendables else 'NO RECOMENDACIÓN',
+            'explicacion': ' '.join(bloques) + (' Si ninguna cuota de la casa fue introducida, se muestran probabilidades pero no se fuerza una recomendación de valor.' if mercados else ''),
+            'escenarios': 50000,
+            'historial_info': historial_info
+        }
+    except Exception as e:
+        return {'error': f'Error en JackBusca: {str(e)}'}
+
