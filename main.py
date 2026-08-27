@@ -42,7 +42,7 @@ DEV_SHOW_EMAIL_TOKENS = os.getenv("DEV_SHOW_EMAIL_TOKENS", "0") == "1"
 ADMIN_EMAIL = os.getenv("API_MASTER_ADMIN_EMAIL", "")
 ADMIN_PASSWORD = os.getenv("API_MASTER_ADMIN_PASSWORD", "")
 ADMIN_USERNAME = os.getenv("API_MASTER_ADMIN_USER", "admin")
-NEQUI_CONTACT_URL = os.getenv("NEQUI_CONTACT_URL", "3007033243")
+NEQUI_NUMBER = os.getenv("NEQUI_NUMBER", "3007033243")
 WOMPI_PUBLIC_KEY = os.getenv("WOMPI_PUBLIC_KEY", "")
 WOMPI_INTEGRITY_SECRET = os.getenv("WOMPI_INTEGRITY_SECRET", "")
 WOMPI_EVENT_SECRET = os.getenv("WOMPI_EVENT_SECRET", "")
@@ -250,10 +250,14 @@ def _history_count(usuario: str) -> int:
     conn.close()
     return int(row["c"] or 0)
 
+def _is_admin(user) -> bool:
+    return bool(user and ADMIN_EMAIL and user.get("correo", "").lower() == ADMIN_EMAIL.lower())
+
+
 def _save_analysis_if_allowed(user, partido_resumen: str, datos: dict):
     if not user:
         return {"guardado": False, "motivo": "invitado"}
-    limite = PREMIUM_HISTORY_LIMIT if user["plan"] in PLANS or user["usuario"] == ADMIN_EMAIL else FREE_HISTORY_LIMIT
+    limite = PREMIUM_HISTORY_LIMIT if user["plan"] in PLANS or _is_admin(user) else FREE_HISTORY_LIMIT
     usados = _history_count(user["usuario"])
     if usados >= limite:
         return {"guardado": False, "motivo": "limite_historial", "usados": usados, "limite": limite, "restantes": 0}
@@ -270,14 +274,6 @@ def _current_user(request: Request):
     if not user:
         raise HTTPException(status_code=401, detail="Sesión inválida o expirada.")
     return user
-
-def _is_admin(user):
-    if not user:
-        return False
-    correo = str(user.get("correo", "")).strip().lower()
-    usuario = str(user.get("usuario", "")).strip()
-    plan = str(user.get("plan", "")).strip().lower()
-    return (ADMIN_EMAIL and correo == ADMIN_EMAIL.strip().lower()) or usuario == ADMIN_USERNAME or plan == "admin"
 
 def _require_premium(request: Request):
     user = _current_user(request)
@@ -339,32 +335,32 @@ def inicializar_db():
         wompi_id TEXT, comprobante TEXT, notas_admin TEXT, creado_en TEXT NOT NULL, actualizado_en TEXT NOT NULL
     )""")
     pago_cols = [r[1] for r in cursor.execute("PRAGMA table_info(pagos)").fetchall()]
-    if 'comprobante' not in pago_cols:
-        cursor.execute('ALTER TABLE pagos ADD COLUMN comprobante TEXT')
-    if 'notas_admin' not in pago_cols:
-        cursor.execute('ALTER TABLE pagos ADD COLUMN notas_admin TEXT')
+    if "comprobante" not in pago_cols:
+        cursor.execute("ALTER TABLE pagos ADD COLUMN comprobante TEXT")
+    if "notas_admin" not in pago_cols:
+        cursor.execute("ALTER TABLE pagos ADD COLUMN notas_admin TEXT")
     conn.commit()
     conn.close()
 
 inicializar_db()
 
+
 def inicializar_admin():
-    """Garantiza la cuenta admin configurada en Render sin romper cuentas existentes."""
     if not ADMIN_EMAIL or not ADMIN_PASSWORD:
         return
     email = ADMIN_EMAIL.strip().lower()
     conn = _db()
     row = conn.execute("SELECT id FROM usuarios WHERE correo=?", (email,)).fetchone()
     if row:
-        conn.execute("UPDATE usuarios SET plan='admin', email_verificado=1, activo=1 WHERE id=?", (row['id'],))
-    else:
-        conflict = conn.execute("SELECT id FROM usuarios WHERE usuario=?", (ADMIN_USERNAME,)).fetchone()
-        if conflict:
-            conn.close()
-            raise RuntimeError("API_MASTER_ADMIN_USER ya está ocupado por otra cuenta.")
-        conn.execute("INSERT INTO usuarios (usuario, correo, password, plan, fecha_expiracion, activo, email_verificado) VALUES (?, ?, ?, 'admin', NULL, 1, 1)",
-                     (ADMIN_USERNAME, email, _password_hash(ADMIN_PASSWORD)))
+        conn.execute("UPDATE usuarios SET plan='admin', email_verificado=1, activo=1 WHERE id=?", (row["id"],))
+        conn.commit(); conn.close(); return
+    conflict = conn.execute("SELECT id FROM usuarios WHERE usuario=?", (ADMIN_USERNAME,)).fetchone()
+    if conflict:
+        conn.close(); raise RuntimeError("API_MASTER_ADMIN_USER ya está ocupado por otra cuenta.")
+    conn.execute("INSERT INTO usuarios (usuario, correo, password, plan, fecha_expiracion, activo, email_verificado) VALUES (?, ?, ?, ?, NULL, 1, 1)",
+                 (ADMIN_USERNAME, email, _password_hash(ADMIN_PASSWORD), "admin"))
     conn.commit(); conn.close()
+
 
 inicializar_admin()
 
@@ -388,6 +384,12 @@ class ResetPasswordSchema(BaseModel):
 class ActivarPlanSchema(BaseModel):
     usuario: str
     tipo_plan: str  # '1_mes', '3_meses', '12_meses'
+
+class SolicitarPagoSchema(BaseModel):
+    tipo_plan: str
+
+class AdminPagoSchema(BaseModel):
+    nota: str = ""
 
 class GuardarHistorialSchema(BaseModel):
     usuario: str
@@ -746,7 +748,7 @@ def login_usuario(data: LoginSchema):
     token = _new_session(); now=datetime.now(); exp=now+timedelta(days=SESSION_DAYS)
     conn.execute("INSERT INTO sesiones(token,usuario_id,creado_en,expires_at) VALUES(?,?,?,?)", (token,row["id"],now.isoformat(),exp.isoformat()))
     conn.commit(); conn.close()
-    return {"mensaje":"Login exitoso","token":token,"usuario":row["usuario"],"correo":row["correo"],"plan":row["plan"],"fecha_expiracion":row["fecha_expiracion"],"email_verificado":True}
+    return {"mensaje":"Login exitoso","token":token,"usuario":row["usuario"],"correo":row["correo"],"plan":row["plan"],"fecha_expiracion":row["fecha_expiracion"],"email_verificado":True,"es_admin":bool(ADMIN_EMAIL and row["correo"].lower() == ADMIN_EMAIL.lower())}
 
 @app.post("/auth/logout")
 def logout_usuario(request: Request):
@@ -759,7 +761,7 @@ def auth_me(user=Depends(_current_user)):
     return user
 
 # ==========================================
-# COMERCIAL / PLANES / NEQUI + ADMINISTRACIÓN
+# COMERCIAL / PLANES / WOMPI
 # ==========================================
 @app.get("/planes")
 def listar_planes():
@@ -767,31 +769,85 @@ def listar_planes():
     for pid,p in PLANS.items():
         total,base,tax=_plan_amount(pid)
         salida[pid]={"nombre":p["name"],"dias":p["days"],"precio_base":base,"iva":tax,"precio_total":total,"iva_aplicado":APPLY_IVA}
-    return {"planes":salida,"moneda":"COP","metodo_pago":"Nequi directo","contacto_nequi":NEQUI_CONTACT_URL}
+    return {"planes":salida,"moneda":"COP"}
 
-class SolicitarPagoSchema(BaseModel):
-    tipo_plan: str
+@app.post("/suscripcion/checkout")
+def crear_checkout(plan_id: str, request: Request, user=Depends(_current_user)):
+    if plan_id not in PLANS: raise HTTPException(status_code=400, detail="Plan no válido.")
+    if not WOMPI_PUBLIC_KEY or not WOMPI_INTEGRITY_SECRET:
+        raise HTTPException(status_code=503, detail="Wompi no está configurado en producción todavía.")
+    amount,_,_= _plan_amount(plan_id)
+    reference=f"AMP-{user['id']}-{secrets.token_hex(6).upper()}"
+    integrity=hashlib.sha256(f"{reference}{amount*100}COP{WOMPI_INTEGRITY_SECRET}".encode()).hexdigest()
+    now=datetime.now().isoformat()
+    conn=_db(); conn.execute("INSERT INTO pagos(referencia,usuario,plan,monto,moneda,estado,creado_en,actualizado_en) VALUES(?,?,?,?,?,?,?,?)",(reference,user['usuario'],plan_id,amount*100,'COP','PENDING',now,now)); conn.commit(); conn.close()
+    checkout_url="https://checkout.wompi.co/p/"
+    return {"reference":reference,"plan":plan_id,"amount_in_cents":amount*100,"currency":"COP","public_key":WOMPI_PUBLIC_KEY,"integrity_signature":integrity,"checkout_url":checkout_url,"mensaje":"El plan se activa únicamente cuando Wompi confirme APPROVED mediante webhook."}
+
+@app.post("/wompi/webhook")
+async def wompi_webhook(request: Request):
+    body=await request.json()
+    if WOMPI_EVENT_SECRET:
+        sig=body.get("signature",{})
+        props=sig.get("properties",[])
+        timestamp=body.get("timestamp")
+        data=body.get("data",{})
+        def get_path(obj,path):
+            cur=obj
+            for part in path.split('.'):
+                if isinstance(cur,dict): cur=cur.get(part)
+                else: return None
+            return cur
+        values=[]
+        for prop in props:
+            val=get_path(data,prop)
+            if val is None: val=get_path(body,prop)
+            values.append(str(val if val is not None else ''))
+        payload=''.join(values)+str(timestamp)+WOMPI_EVENT_SECRET
+        expected=hashlib.sha256(payload.encode()).hexdigest()
+        received=request.headers.get('X-Event-Checksum') or sig.get('checksum','')
+        if not received or not hmac.compare_digest(expected,received):
+            raise HTTPException(status_code=401, detail="Firma Wompi inválida.")
+    event=body.get('event')
+    tx=body.get('data',{}).get('transaction',{})
+    reference=tx.get('reference')
+    status=tx.get('status')
+    if event=='transaction.updated' and reference:
+        conn=_db(); row=conn.execute("SELECT usuario,plan,monto,estado FROM pagos WHERE referencia=?",(reference,)).fetchone()
+        if row:
+            now=datetime.now().isoformat()
+            conn.execute("UPDATE pagos SET estado=?,wompi_id=?,actualizado_en=? WHERE referencia=?",(status,tx.get('id'),now,reference)); conn.commit(); conn.close()
+            if status=='APPROVED' and row['estado']!='APPROVED':
+                expiration=_activate_plan_by_username(row['usuario'],row['plan'])
+                # Notificación best-effort: no bloquea el webhook si SMTP no está configurado.
+                conn2=_db(); u=conn2.execute("SELECT correo FROM usuarios WHERE usuario=?",(row['usuario'],)).fetchone(); conn2.close()
+                if u:
+                    try: _send_email(u['correo'], 'API Master Pro: pago aprobado', f"Tu plan {row['plan']} está activo hasta {expiration.strftime('%Y-%m-%d')}.")
+                    except Exception: pass
+    return {"ok":True}
 
 @app.post("/pagos/solicitar")
 def solicitar_pago(data: SolicitarPagoSchema, user=Depends(_current_user)):
     if data.tipo_plan not in PLANS:
         raise HTTPException(status_code=400, detail="Plan no válido.")
-    amount,base,tax=_plan_amount(data.tipo_plan)
-    reference=f"AMP-NEQUI-{user['id']}-{secrets.token_hex(5).upper()}"
-    now=datetime.now().isoformat()
-    conn=_db()
-    conn.execute("INSERT INTO pagos(referencia,usuario,plan,monto,moneda,estado,comprobante,notas_admin,creado_en,actualizado_en) VALUES(?,?,?,?,?,?,?,?,?,?)",
+    amount, base, tax = _plan_amount(data.tipo_plan)
+    reference = f"AMP-NEQUI-{user['id']}-{secrets.token_hex(5).upper()}"
+    now = datetime.now().isoformat()
+    conn = _db()
+    conn.execute("INSERT INTO pagos(referencia,usuario,plan,monto,moneda,estado,comprobante,wompi_id,creado_en,actualizado_en) VALUES(?,?,?,?,?,?,?,?,?,?)",
                  (reference,user['usuario'],data.tipo_plan,amount,'COP','PENDING',None,None,now,now))
     conn.commit(); conn.close()
-    return {"ok":True,"referencia":reference,"plan":data.tipo_plan,"precio_base":base,"iva":tax,"monto":amount,"moneda":"COP","estado":"PENDING","contacto_nequi":NEQUI_CONTACT_URL,
-            "mensaje":"Realiza el pago por Nequi y envía el comprobante al contacto indicado. El administrador activará el plan después de verificarlo."}
+    return {"ok":True,"referencia":reference,"plan":data.tipo_plan,"precio_base":base,"iva":tax,"monto":amount,"moneda":"COP","estado":"PENDING","contacto_nequi":NEQUI_NUMBER,
+            "mensaje":"Realiza el pago por Nequi al 3007033243 y envía el comprobante al administrador. El plan se activa después de verificar el pago."}
+
 
 @app.get("/pagos/mis-pagos")
 def mis_pagos(user=Depends(_current_user)):
     conn=_db()
-    rows=conn.execute("SELECT referencia,plan,monto,moneda,estado,comprobante,notas_admin,creado_en,actualizado_en FROM pagos WHERE usuario=? ORDER BY id DESC",(user['usuario'],)).fetchall()
+    rows=conn.execute("SELECT referencia,plan,monto,moneda,estado,comprobante,creado_en,actualizado_en FROM pagos WHERE usuario=? ORDER BY id DESC",(user['usuario'],)).fetchall()
     conn.close()
     return {"pagos":[dict(r) for r in rows]}
+
 
 @app.get("/admin/resumen")
 def admin_resumen(user=Depends(_current_user)):
@@ -805,6 +861,7 @@ def admin_resumen(user=Depends(_current_user)):
     conn.close()
     return {"usuarios":usuarios,"premium":premium,"pagos_aprobados":pagos,"pagos_pendientes":pendientes}
 
+
 @app.get("/admin/pagos")
 def admin_pagos(user=Depends(_current_user)):
     if not _is_admin(user):
@@ -814,36 +871,37 @@ def admin_pagos(user=Depends(_current_user)):
     conn.close()
     return {"pagos":[dict(r) for r in rows]}
 
-class AdminPagoSchema(BaseModel):
-    nota: str = ""
 
 @app.post("/admin/pagos/{pago_id}/aprobar")
 def admin_aprobar_pago(pago_id:int, data:AdminPagoSchema=None, user=Depends(_current_user)):
     if not _is_admin(user):
         raise HTTPException(status_code=403, detail="Acceso de administrador requerido.")
-    conn=_db(); row=conn.execute("SELECT id,usuario,plan,estado FROM pagos WHERE id=?",(pago_id,)).fetchone()
+    conn=_db()
+    row=conn.execute("SELECT id,usuario,plan,estado FROM pagos WHERE id=?",(pago_id,)).fetchone()
     if not row:
         conn.close(); raise HTTPException(status_code=404, detail="Pago no encontrado.")
     if row['estado']=='APPROVED':
         conn.close(); return {"ok":True,"mensaje":"El pago ya estaba aprobado."}
     nota=(data.nota if data else "").strip()
-    now=datetime.now().isoformat()
-    conn.execute("UPDATE pagos SET estado='APPROVED',notas_admin=?,actualizado_en=? WHERE id=?",(nota,now,pago_id))
+    conn.execute("UPDATE pagos SET estado='APPROVED',notas_admin=?,actualizado_en=? WHERE id=?",(nota,datetime.now().isoformat(),pago_id))
     conn.commit(); conn.close()
     expiration=_activate_plan_by_username(row['usuario'],row['plan'])
     return {"ok":True,"mensaje":"Pago aprobado y plan activado.","usuario":row['usuario'],"plan":row['plan'],"fecha_expiracion":expiration.strftime('%Y-%m-%d %H:%M:%S')}
+
 
 @app.post("/admin/pagos/{pago_id}/rechazar")
 def admin_rechazar_pago(pago_id:int, data:AdminPagoSchema=None, user=Depends(_current_user)):
     if not _is_admin(user):
         raise HTTPException(status_code=403, detail="Acceso de administrador requerido.")
-    nota=(data.nota if data else "").strip()
-    conn=_db(); row=conn.execute("SELECT id FROM pagos WHERE id=?",(pago_id,)).fetchone()
+    conn=_db()
+    row=conn.execute("SELECT id FROM pagos WHERE id=?",(pago_id,)).fetchone()
     if not row:
         conn.close(); raise HTTPException(status_code=404, detail="Pago no encontrado.")
+    nota=(data.nota if data else "").strip()
     conn.execute("UPDATE pagos SET estado='REJECTED',notas_admin=?,actualizado_en=? WHERE id=?",(nota,datetime.now().isoformat(),pago_id))
     conn.commit(); conn.close()
     return {"ok":True,"mensaje":"Pago rechazado."}
+
 
 # ==========================================
 # RUTAS DE HISTORIAL
