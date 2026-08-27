@@ -17,6 +17,7 @@ import urllib.error
 import smtplib
 from email.message import EmailMessage
 from fastapi import Request
+from fastapi.responses import HTMLResponse
 
 app = FastAPI(
     title="API Master Pro - Pinnacle Optimized Edition",
@@ -115,7 +116,7 @@ def _send_verification_email(email: str, usuario: str, token: str):
                        f"Hola {usuario},\n\nConfirma tu correo para activar tu cuenta en API Master Pro:\n\n{link}\n\nEste enlace vence en {EMAIL_VERIFICATION_DAYS} día(s). Si no creaste esta cuenta, ignora este mensaje.")
 
 def _send_reset_email(email: str, usuario: str, token: str):
-    link = APP_BASE_URL.rstrip('/') + '/?reset_password=' + token
+    link = APP_BASE_URL.rstrip('/') + '/auth/reset-password?token=' + token
     return _send_email(email, 'API Master Pro: recuperación de contraseña',
                        f"Hola {usuario},\n\nRecibimos una solicitud para cambiar tu contraseña. Usa este enlace:\n\n{link}\n\nEl enlace vence en {PASSWORD_RESET_MINUTES} minutos. Si no solicitaste el cambio, ignora este mensaje.")
 
@@ -402,7 +403,73 @@ def verificar_correo(token: str):
     conn.execute("UPDATE usuarios SET email_verificado=1 WHERE id=?", (user_id,))
     row = conn.execute("SELECT usuario,correo FROM usuarios WHERE id=?", (user_id,)).fetchone()
     conn.commit(); conn.close()
-    return {"mensaje":"Correo verificado correctamente. Ya puedes iniciar sesión.", "usuario":row["usuario"], "correo":row["correo"]}
+    return HTMLResponse(f"""
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Correo verificado - API Master Pro</title>
+    <style>
+        body {{
+            margin: 0;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: #050817;
+            color: white;
+            font-family: Arial, sans-serif;
+        }}
+        .card {{
+            width: min(90%, 480px);
+            padding: 40px;
+            text-align: center;
+            background: #11182b;
+            border: 1px solid #24304d;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0,0,0,.45);
+        }}
+        .icon {{
+            font-size: 64px;
+            margin-bottom: 15px;
+        }}
+        h1 {{
+            color: #20d89a;
+            margin-bottom: 10px;
+        }}
+        p {{
+            color: #cbd5e1;
+            line-height: 1.6;
+        }}
+        .user {{
+            color: #20d89a;
+            font-weight: bold;
+        }}
+        a {{
+            display: inline-block;
+            margin-top: 20px;
+            padding: 13px 25px;
+            border-radius: 10px;
+            background: #20d89a;
+            color: #061018;
+            text-decoration: none;
+            font-weight: bold;
+        }}
+    </style>
+</head>
+<body>
+    <div class="card">
+        <div class="icon">✅</div>
+        <h1>Correo verificado</h1>
+        <p>Tu cuenta de API Master Pro ya está activa.</p>
+        <p>Usuario: <span class="user">{row["usuario"]}</span></p>
+        <p>Ya puedes iniciar sesión.</p>
+        <a href="{APP_BASE_URL}">Ir a API Master Pro</a>
+    </div>
+</body>
+</html>
+""")
 
 @app.post("/auth/resend-verification")
 def reenviar_verificacion(data: EmailSchema):
@@ -440,7 +507,125 @@ def solicitar_recuperacion(data: EmailSchema):
     if DEV_SHOW_EMAIL_TOKENS and not sent:
         response["dev_reset_link"] = APP_BASE_URL.rstrip('/') + '/?reset_password=' + token
     return response
+@app.get("/auth/reset-password", response_class=HTMLResponse)
+def mostrar_reset_password(token: str):
+    return HTMLResponse(f"""
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Restablecer contraseña - API Master Pro</title>
+    <style>
+        body {{
+            margin: 0;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: #050817;
+            color: white;
+            font-family: Arial, sans-serif;
+        }}
+        .card {{
+            width: min(90%, 430px);
+            padding: 35px;
+            background: #11182b;
+            border: 1px solid #24304d;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0,0,0,.45);
+        }}
+        h1 {{
+            color: #20d89a;
+            text-align: center;
+        }}
+        p {{
+            color: #cbd5e1;
+            text-align: center;
+        }}
+        label {{
+            display: block;
+            margin-top: 18px;
+            margin-bottom: 7px;
+        }}
+        input {{
+            width: 100%;
+            box-sizing: border-box;
+            padding: 13px;
+            border-radius: 10px;
+            border: 1px solid #34415f;
+            background: #0a1020;
+            color: white;
+        }}
+        button {{
+            width: 100%;
+            margin-top: 25px;
+            padding: 14px;
+            border: 0;
+            border-radius: 10px;
+            background: #20d89a;
+            color: #061018;
+            font-weight: bold;
+            cursor: pointer;
+        }}
+        #mensaje {{
+            margin-top: 15px;
+            color: #ff6b6b;
+            text-align: center;
+        }}
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>🔐 Recuperar contraseña</h1>
+        <p>Escribe tu nueva contraseña.</p>
 
+        <form id="resetForm">
+            <label>Nueva contraseña</label>
+            <input id="password" type="password" minlength="8" required>
+
+            <button type="submit">Cambiar contraseña</button>
+        </form>
+
+        <div id="mensaje"></div>
+    </div>
+
+    <script>
+        document.getElementById("resetForm").addEventListener("submit", async function(e) {{
+            e.preventDefault();
+
+            const password = document.getElementById("password").value;
+            const mensaje = document.getElementById("mensaje");
+
+            try {{
+                const response = await fetch("/auth/reset-password", {{
+                    method: "POST",
+                    headers: {{
+                        "Content-Type": "application/json"
+                    }},
+                    body: JSON.stringify({{
+                        token: "{token}",
+                        password: password
+                    }})
+                }});
+
+                const html = await response.text();
+
+                if (response.ok) {{
+                    document.open();
+                    document.write(html);
+                    document.close();
+                }} else {{
+                    mensaje.textContent = html;
+                }}
+            }} catch (error) {{
+                mensaje.textContent = "No se pudo completar la operación.";
+            }}
+        }});
+    </script>
+</body>
+</html>
+""")
 @app.post("/auth/reset-password")
 def resetear_password(data: ResetPasswordSchema):
     if len(data.password) < 8:
@@ -452,7 +637,66 @@ def resetear_password(data: ResetPasswordSchema):
     conn.execute("UPDATE usuarios SET password=?, email_verificado=1 WHERE id=?", (_password_hash(data.password), user_id))
     conn.execute("DELETE FROM sesiones WHERE usuario_id=?", (user_id,))
     conn.commit(); conn.close()
-    return {"mensaje":"Contraseña actualizada. Inicia sesión nuevamente."}
+    return HTMLResponse("""
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Contraseña actualizada - API Master Pro</title>
+    <style>
+        body {
+            margin: 0;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: #050817;
+            color: white;
+            font-family: Arial, sans-serif;
+        }
+        .card {
+            width: min(90%, 480px);
+            padding: 40px;
+            text-align: center;
+            background: #11182b;
+            border: 1px solid #24304d;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0,0,0,.45);
+        }
+        .icon {
+            font-size: 64px;
+        }
+        h1 {
+            color: #20d89a;
+        }
+        p {
+            color: #cbd5e1;
+            line-height: 1.6;
+        }
+        a {
+            display: inline-block;
+            margin-top: 20px;
+            padding: 13px 25px;
+            border-radius: 10px;
+            background: #20d89a;
+            color: #061018;
+            text-decoration: none;
+            font-weight: bold;
+        }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <div class="icon">✅</div>
+        <h1>Contraseña actualizada</h1>
+        <p>Tu contraseña fue cambiada correctamente.</p>
+        <p>Ya puedes iniciar sesión nuevamente.</p>
+        <a href="/">Iniciar sesión</a>
+    </div>
+</body>
+</html>
+""")
 
 @app.post("/auth/login")
 def login_usuario(data: LoginSchema):
