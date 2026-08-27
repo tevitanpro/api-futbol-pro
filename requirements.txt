@@ -1,9 +1,3 @@
 fastapi
-uvicorn
-requests
-beautifulsoup4
-selenium
+uvicorn[standard]
 psycopg2-binary
-sqlalchemy
-passlib[bcrypt]
-python-jose[cryptography]
