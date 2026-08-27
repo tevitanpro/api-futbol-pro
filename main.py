@@ -15,11 +15,12 @@ import json
 import smtplib
 from email.message import EmailMessage
 from fastapi import Request
+from urllib.parse import urlencode
 
 app = FastAPI(
     title="API Master Pro - Pinnacle Optimized Edition",
     description="Motor de simulación matemática avanzada de 50,000 escenarios con base de datos e historial",
-    version="8.8.0"
+    version="8.9.0"
 )
 
 # ==========================================
@@ -34,6 +35,7 @@ APP_BASE_URL = os.getenv("APP_BASE_URL", "https://api-futbol-pro.onrender.com")
 DEV_SHOW_EMAIL_TOKENS = os.getenv("DEV_SHOW_EMAIL_TOKENS", "0") == "1"
 ADMIN_EMAIL = os.getenv("API_MASTER_ADMIN_EMAIL", "")
 ADMIN_PASSWORD = os.getenv("API_MASTER_ADMIN_PASSWORD", "")
+ADMIN_USERNAME = os.getenv("API_MASTER_ADMIN_USERNAME", "admin")
 WOMPI_PUBLIC_KEY = os.getenv("WOMPI_PUBLIC_KEY", "")
 WOMPI_INTEGRITY_SECRET = os.getenv("WOMPI_INTEGRITY_SECRET", "")
 WOMPI_EVENT_SECRET = os.getenv("WOMPI_EVENT_SECRET", "")
@@ -170,7 +172,7 @@ def _get_user_from_token(token: str):
     if not token:
         return None
     conn = _db()
-    row = conn.execute("SELECT u.id,u.usuario,u.correo,u.plan,u.fecha_expiracion,u.email_verificado,s.expires_at FROM sesiones s JOIN usuarios u ON u.id=s.usuario_id WHERE s.token=?", (token,)).fetchone()
+    row = conn.execute("SELECT u.id,u.usuario,u.correo,u.plan,u.fecha_expiracion,u.email_verificado,u.rol,s.expires_at FROM sesiones s JOIN usuarios u ON u.id=s.usuario_id WHERE s.token=?", (token,)).fetchone()
     if not row:
         conn.close(); return None
     try:
@@ -189,7 +191,7 @@ def _get_user_from_token(token: str):
         except Exception: plan=row["plan"]
     else: plan=row["plan"]
     conn.close()
-    return {"id": row["id"], "usuario": row["usuario"], "correo": row["correo"], "plan": plan, "fecha_expiracion": row["fecha_expiracion"], "email_verificado": bool(row["email_verificado"])}
+    return {"id": row["id"], "usuario": row["usuario"], "correo": row["correo"], "plan": plan, "fecha_expiracion": row["fecha_expiracion"], "email_verificado": bool(row["email_verificado"]), "rol": row["rol"]}
 
 def _optional_user(request: Request):
     auth = request.headers.get("Authorization", "")
@@ -225,7 +227,7 @@ def _current_user(request: Request):
 
 def _require_premium(request: Request):
     user = _current_user(request)
-    if user["plan"] not in PLANS and user["usuario"] != ADMIN_EMAIL:
+    if user["plan"] not in PLANS and user.get("rol") != "admin":
         raise HTTPException(status_code=402, detail="JackBusca requiere un plan activo.")
     return user
 
@@ -255,15 +257,18 @@ def inicializar_db():
             plan TEXT DEFAULT 'gratis',
             fecha_expiracion TEXT,
             activo INTEGER DEFAULT 1,
-            email_verificado INTEGER DEFAULT 0
+            email_verificado INTEGER DEFAULT 0,
+            rol TEXT NOT NULL DEFAULT 'usuario'
         )
     """)
     # Migración segura para instalaciones v8.6 existentes.
     cols = [r[1] for r in cursor.execute("PRAGMA table_info(usuarios)").fetchall()]
     if 'email_verificado' not in cols:
         cursor.execute("ALTER TABLE usuarios ADD COLUMN email_verificado INTEGER DEFAULT 0")
-        # Las cuentas existentes no pierden acceso; las nuevas sí requieren verificación.
         cursor.execute("UPDATE usuarios SET email_verificado=1 WHERE email_verificado IS NULL OR email_verificado=0")
+        cols = [r[1] for r in cursor.execute("PRAGMA table_info(usuarios)").fetchall()]
+    if 'rol' not in cols:
+        cursor.execute("ALTER TABLE usuarios ADD COLUMN rol TEXT NOT NULL DEFAULT 'usuario'")
     
     # Tabla de Historial de Análisis
     cursor.execute("""
@@ -286,6 +291,21 @@ def inicializar_db():
     conn.close()
 
 inicializar_db()
+
+def _bootstrap_admin():
+    # Crea o eleva una cuenta administrativa solo si se configuran credenciales por variables de entorno.
+    if not ADMIN_EMAIL or not ADMIN_PASSWORD:
+        return
+    conn=_db()
+    row=conn.execute("SELECT id FROM usuarios WHERE correo=?",(ADMIN_EMAIL.strip().lower(),)).fetchone()
+    if row:
+        conn.execute("UPDATE usuarios SET rol='admin', activo=1, email_verificado=1 WHERE id=?",(row['id'],))
+    else:
+        conn.execute("INSERT INTO usuarios(usuario,correo,password,plan,activo,email_verificado,rol) VALUES(?,?,?,?,?,?,?)",
+                     (ADMIN_USERNAME,ADMIN_EMAIL.strip().lower(),_password_hash(ADMIN_PASSWORD),'gratis',1,1,'admin'))
+    conn.commit(); conn.close()
+
+_bootstrap_admin()
 
 # Modelos Pydantic para las peticiones HTTP
 class RegistroSchema(BaseModel):
@@ -328,7 +348,7 @@ def registrar_usuario(data: RegistroSchema):
         raise HTTPException(status_code=400, detail="Ingresa un correo electrónico válido.")
     conn = _db()
     try:
-        conn.execute("INSERT INTO usuarios (usuario, correo, password, plan, email_verificado) VALUES (?, ?, ?, ?, 0)",
+        conn.execute("INSERT INTO usuarios (usuario, correo, password, plan, email_verificado, rol) VALUES (?, ?, ?, ?, 0, 'usuario')",
                      (usuario, email, _password_hash(data.password), 'gratis'))
         conn.commit()
         row = conn.execute("SELECT id FROM usuarios WHERE usuario=?", (usuario,)).fetchone()
@@ -411,9 +431,11 @@ def resetear_password(data: ResetPasswordSchema):
 @app.post("/auth/login")
 def login_usuario(data: LoginSchema):
     conn = _db()
-    row = conn.execute("SELECT id, usuario, correo, password, plan, fecha_expiracion, email_verificado FROM usuarios WHERE usuario = ?", (data.usuario.strip(),)).fetchone()
+    row = conn.execute("SELECT id, usuario, correo, password, plan, fecha_expiracion, email_verificado, rol FROM usuarios WHERE usuario = ?", (data.usuario.strip(),)).fetchone()
     if not row or not _password_verify(data.password, row["password"]):
         conn.close(); raise HTTPException(status_code=401, detail="Usuario o contraseña incorrectos.")
+    if not row["activo"]:
+        conn.close(); raise HTTPException(status_code=403, detail="Esta cuenta está suspendida o bloqueada.")
     if not row["email_verificado"]:
         conn.close(); raise HTTPException(status_code=403, detail="Debes verificar tu correo antes de iniciar sesión.")
     if not row["password"].startswith("pbkdf2$"):
@@ -421,7 +443,7 @@ def login_usuario(data: LoginSchema):
     token = _new_session(); now=datetime.now(); exp=now+timedelta(days=SESSION_DAYS)
     conn.execute("INSERT INTO sesiones(token,usuario_id,creado_en,expires_at) VALUES(?,?,?,?)", (token,row["id"],now.isoformat(),exp.isoformat()))
     conn.commit(); conn.close()
-    return {"mensaje":"Login exitoso","token":token,"usuario":row["usuario"],"correo":row["correo"],"plan":row["plan"],"fecha_expiracion":row["fecha_expiracion"],"email_verificado":True}
+    return {"mensaje":"Login exitoso","token":token,"usuario":row["usuario"],"correo":row["correo"],"plan":row["plan"],"fecha_expiracion":row["fecha_expiracion"],"email_verificado":True,"rol":row["rol"]}
 
 @app.post("/auth/logout")
 def logout_usuario(request: Request):
@@ -454,64 +476,181 @@ def crear_checkout(plan_id: str, request: Request, user=Depends(_current_user)):
     integrity=hashlib.sha256(f"{reference}{amount*100}COP{WOMPI_INTEGRITY_SECRET}".encode()).hexdigest()
     now=datetime.now().isoformat()
     conn=_db(); conn.execute("INSERT INTO pagos(referencia,usuario,plan,monto,moneda,estado,creado_en,actualizado_en) VALUES(?,?,?,?,?,?,?,?)",(reference,user['usuario'],plan_id,amount*100,'COP','PENDING',now,now)); conn.commit(); conn.close()
-    checkout_url="https://checkout.wompi.co/p/"
-    return {"reference":reference,"plan":plan_id,"amount_in_cents":amount*100,"currency":"COP","public_key":WOMPI_PUBLIC_KEY,"integrity_signature":integrity,"checkout_url":checkout_url,"mensaje":"El plan se activa únicamente cuando Wompi confirme APPROVED mediante webhook."}
+    amount_in_cents = amount * 100
+    redirect_url = APP_BASE_URL.rstrip('/') + '/?wompi_return=1'
+    checkout_params = {
+        "public-key": WOMPI_PUBLIC_KEY,
+        "currency": "COP",
+        "amount-in-cents": str(amount_in_cents),
+        "reference": reference,
+        "signature:integrity": integrity,
+        "redirect-url": redirect_url,
+    }
+    checkout_url = "https://checkout.wompi.co/p/?" + urlencode(checkout_params)
+    return {"reference":reference,"plan":plan_id,"amount_in_cents":amount_in_cents,"currency":"COP","public_key":WOMPI_PUBLIC_KEY,"integrity_signature":integrity,"redirect_url":redirect_url,"checkout_url":checkout_url,"mensaje":"El plan se activa únicamente cuando Wompi confirme APPROVED mediante webhook."}
 
 @app.post("/wompi/webhook")
 async def wompi_webhook(request: Request):
-    body=await request.json()
-    if WOMPI_EVENT_SECRET:
-        sig=body.get("signature",{})
-        props=sig.get("properties",[])
-        timestamp=body.get("timestamp")
-        data=body.get("data",{})
-        def get_path(obj,path):
-            cur=obj
-            for part in path.split('.'):
-                if isinstance(cur,dict): cur=cur.get(part)
-                else: return None
-            return cur
-        values=[]
-        for prop in props:
-            val=get_path(data,prop)
-            if val is None: val=get_path(body,prop)
-            values.append(str(val if val is not None else ''))
-        payload=''.join(values)+str(timestamp)+WOMPI_EVENT_SECRET
-        expected=hashlib.sha256(payload.encode()).hexdigest()
-        received=request.headers.get('X-Event-Checksum') or sig.get('checksum','')
-        if not received or not hmac.compare_digest(expected,received):
-            raise HTTPException(status_code=401, detail="Firma Wompi inválida.")
-    event=body.get('event')
-    tx=body.get('data',{}).get('transaction',{})
-    reference=tx.get('reference')
-    status=tx.get('status')
-    if event=='transaction.updated' and reference:
-        conn=_db(); row=conn.execute("SELECT usuario,plan,monto,estado FROM pagos WHERE referencia=?",(reference,)).fetchone()
-        if row:
-            now=datetime.now().isoformat()
-            conn.execute("UPDATE pagos SET estado=?,wompi_id=?,actualizado_en=? WHERE referencia=?",(status,tx.get('id'),now,reference)); conn.commit(); conn.close()
-            if status=='APPROVED' and row['estado']!='APPROVED':
-                expiration=_activate_plan_by_username(row['usuario'],row['plan'])
-                # Notificación best-effort: no bloquea el webhook si SMTP no está configurado.
-                conn2=_db(); u=conn2.execute("SELECT correo FROM usuarios WHERE usuario=?",(row['usuario'],)).fetchone(); conn2.close()
-                if u:
-                    try: _send_email(u['correo'], 'API Master Pro: pago aprobado', f"Tu plan {row['plan']} está activo hasta {expiration.strftime('%Y-%m-%d')}.")
-                    except Exception: pass
-    return {"ok":True}
+    # El webhook nunca debe confiar en el frontend ni aceptar eventos sin firma.
+    if not WOMPI_EVENT_SECRET:
+        raise HTTPException(status_code=503, detail="WOMPI_EVENT_SECRET no configurado.")
+
+    body = await request.json()
+    sig = body.get("signature", {}) or {}
+    props = sig.get("properties", []) or []
+    timestamp = body.get("timestamp")
+    if timestamp is None:
+        raise HTTPException(status_code=401, detail="Evento Wompi sin timestamp.")
+
+    data = body.get("data", {}) or {}
+    def get_path(obj, path):
+        cur = obj
+        for part in str(path).split('.'):
+            if isinstance(cur, dict):
+                cur = cur.get(part)
+            else:
+                return None
+        return cur
+
+    values = []
+    for prop in props:
+        val = get_path(data, prop)
+        if val is None:
+            val = get_path(body, prop)
+        values.append(str(val if val is not None else ''))
+
+    payload = ''.join(values) + str(timestamp) + WOMPI_EVENT_SECRET
+    expected = hashlib.sha256(payload.encode()).hexdigest()
+    received = request.headers.get('X-Event-Checksum') or sig.get('checksum', '')
+    if not received or not hmac.compare_digest(expected, received):
+        raise HTTPException(status_code=401, detail="Firma Wompi inválida.")
+
+    # Evita aceptar eventos extremadamente antiguos/reproducidos. Tolerancia amplia
+    # para no rechazar eventos legítimos por pequeñas diferencias de reloj.
+    try:
+        age = abs(datetime.now(timezone.utc).timestamp() - float(timestamp))
+        if age > 15 * 60:
+            raise HTTPException(status_code=401, detail="Evento Wompi fuera de ventana de seguridad.")
+    except ValueError:
+        raise HTTPException(status_code=401, detail="Timestamp Wompi inválido.")
+
+    event = body.get('event')
+    tx = data.get('transaction', {}) or {}
+    reference = tx.get('reference')
+    status = tx.get('status')
+    if event != 'transaction.updated' or not reference:
+        return {"ok": True, "procesado": False}
+
+    conn = _db()
+    row = conn.execute(
+        "SELECT usuario,plan,monto,moneda,estado FROM pagos WHERE referencia=?",
+        (reference,)
+    ).fetchone()
+    if not row:
+        conn.close()
+        # Evento auténtico pero sin una orden local: no otorgamos acceso.
+        return {"ok": True, "procesado": False, "motivo": "referencia_no_registrada"}
+
+    # La transacción aprobada debe coincidir exactamente con la orden local.
+    tx_amount = tx.get('amount_in_cents')
+    tx_currency = tx.get('currency')
+    if tx_amount is None or int(tx_amount) != int(row['monto']) or tx_currency != row['moneda']:
+        conn.close()
+        raise HTTPException(status_code=409, detail="Monto o moneda no coinciden con la orden local.")
+
+    now = datetime.now().isoformat()
+    previous = row['estado']
+
+    # Idempotencia: solo la transición PENDING/otros -> APPROVED puede otorgar
+    # una membresía. Si Wompi reenvía el mismo evento, rowcount será 0 y no
+    # volveremos a extender el plan.
+    cur = conn.execute(
+        "UPDATE pagos SET estado=?, wompi_id=?, actualizado_en=? WHERE referencia=? AND estado<>?",
+        (status, tx.get('id'), now, reference, 'APPROVED')
+    )
+    changed = cur.rowcount
+    conn.commit()
+    conn.close()
+
+    if status == 'APPROVED' and previous != 'APPROVED' and changed == 1:
+        expiration = _activate_plan_by_username(row['usuario'], row['plan'])
+        conn2 = _db()
+        u = conn2.execute("SELECT correo FROM usuarios WHERE usuario=?", (row['usuario'],)).fetchone()
+        conn2.close()
+        if u:
+            try:
+                _send_email(
+                    u['correo'],
+                    'API Master Pro: pago aprobado',
+                    f"Tu plan {row['plan']} está activo hasta {expiration.strftime('%Y-%m-%d')}."
+                )
+            except Exception:
+                pass
+
+    return {"ok": True, "procesado": True, "idempotente": changed == 0}
+
+def _require_admin(request: Request):
+    user = _current_user(request)
+    if user.get("rol") != "admin":
+        raise HTTPException(status_code=403, detail="Acceso de administrador requerido.")
+    return user
 
 @app.get("/admin/resumen")
 def admin_resumen(request: Request):
-    # El administrador se identifica por una cuenta ADMIN real, nunca por una clave maestra en HTML.
-    user=_current_user(request)
-    if not ADMIN_EMAIL or user['correo'].lower()!=ADMIN_EMAIL.lower():
-        raise HTTPException(status_code=403, detail="Acceso de administrador requerido.")
+    _require_admin(request)
     conn=_db()
     usuarios=conn.execute("SELECT COUNT(*) c FROM usuarios").fetchone()['c']
+    activos=conn.execute("SELECT COUNT(*) c FROM usuarios WHERE activo=1").fetchone()['c']
     premium=conn.execute("SELECT COUNT(*) c FROM usuarios WHERE plan != 'gratis'").fetchone()['c']
     pagos=conn.execute("SELECT COUNT(*) c FROM pagos WHERE estado='APPROVED'").fetchone()['c']
     pendientes=conn.execute("SELECT COUNT(*) c FROM pagos WHERE estado='PENDING'").fetchone()['c']
     conn.close()
-    return {"usuarios":usuarios,"premium":premium,"pagos_aprobados":pagos,"pagos_pendientes":pendientes}
+    return {"usuarios":usuarios,"activos":activos,"premium":premium,"pagos_aprobados":pagos,"pagos_pendientes":pendientes}
+
+@app.get("/admin/usuarios")
+def admin_usuarios(request: Request, q: str = "", limit: int = 50):
+    _require_admin(request)
+    limit=max(1,min(limit,100))
+    conn=_db()
+    term=f"%{q.strip()}%"
+    rows=conn.execute("""SELECT id,usuario,correo,rol,plan,fecha_expiracion,activo,email_verificado FROM usuarios
+                         WHERE usuario LIKE ? OR correo LIKE ? ORDER BY id DESC LIMIT ?""", (term,term,limit)).fetchall()
+    conn.close()
+    return {"usuarios":[dict(r) for r in rows]}
+
+@app.get("/admin/usuarios/{user_id}")
+def admin_usuario_detalle(user_id: int, request: Request):
+    _require_admin(request)
+    conn=_db()
+    row=conn.execute("SELECT id,usuario,correo,rol,plan,fecha_expiracion,activo,email_verificado FROM usuarios WHERE id=?",(user_id,)).fetchone()
+    if not row:
+        conn.close(); raise HTTPException(status_code=404, detail="Usuario no encontrado.")
+    hist=conn.execute("SELECT id,fecha,partido_resumen FROM historial WHERE usuario=? ORDER BY id DESC LIMIT 10",(row['usuario'],)).fetchall()
+    conn.close()
+    return {"usuario":dict(row),"historial":[dict(x) for x in hist]}
+
+@app.post("/admin/usuarios/{user_id}/estado")
+def admin_cambiar_estado(user_id: int, request: Request, estado: str):
+    _require_admin(request)
+    if estado not in {"ACTIVO","SUSPENDIDO","BLOQUEADO"}:
+        raise HTTPException(status_code=400, detail="Estado no válido.")
+    conn=_db(); row=conn.execute("SELECT usuario FROM usuarios WHERE id=?",(user_id,)).fetchone()
+    if not row: conn.close(); raise HTTPException(status_code=404, detail="Usuario no encontrado.")
+    conn.execute("UPDATE usuarios SET activo=? WHERE id=?", (1 if estado=="ACTIVO" else 0,user_id))
+    conn.commit(); conn.close()
+    return {"ok":True,"usuario":row['usuario'],"estado":estado}
+
+@app.post("/admin/usuarios/{user_id}/rol")
+def admin_cambiar_rol(user_id: int, request: Request, rol: str):
+    admin=_require_admin(request)
+    if rol not in {"usuario","admin"}:
+        raise HTTPException(status_code=400, detail="Rol no válido.")
+    if user_id == admin['id'] and rol != 'admin':
+        raise HTTPException(status_code=400, detail="No puedes quitarte tu propio rol de administrador desde esta sesión.")
+    conn=_db(); row=conn.execute("SELECT usuario FROM usuarios WHERE id=?",(user_id,)).fetchone()
+    if not row: conn.close(); raise HTTPException(status_code=404, detail="Usuario no encontrado.")
+    conn.execute("UPDATE usuarios SET rol=? WHERE id=?",(rol,user_id)); conn.commit(); conn.close()
+    return {"ok":True,"usuario":row['usuario'],"rol":rol}
 
 # ==========================================
 # RUTAS DE HISTORIAL
