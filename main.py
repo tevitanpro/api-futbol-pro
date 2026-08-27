@@ -110,7 +110,7 @@ def _consume_email_token(raw: str, purpose: str):
     return row["usuario_id"]
 
 def _send_verification_email(email: str, usuario: str, token: str):
-    link = APP_BASE_URL.rstrip('/') + '/?verify_email=' + token
+    link = APP_BASE_URL.rstrip('/') + '/auth/verify-email?token=' + token
     return _send_email(email, 'API Master Pro: verifica tu correo',
                        f"Hola {usuario},\n\nConfirma tu correo para activar tu cuenta en API Master Pro:\n\n{link}\n\nEste enlace vence en {EMAIL_VERIFICATION_DAYS} día(s). Si no creaste esta cuenta, ignora este mensaje.")
 
