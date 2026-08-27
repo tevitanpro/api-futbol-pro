@@ -850,10 +850,26 @@ def mis_pagos(user=Depends(_current_user)):
     return {"pagos":[dict(r) for r in rows]}
 
 
+def _sync_expired_plans():
+    """Marca como gratis los planes cuyo vencimiento ya pasó."""
+    conn = _db()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conn.execute("""
+        UPDATE usuarios
+        SET plan='gratis', fecha_expiracion=fecha_expiracion
+        WHERE plan NOT IN ('gratis','admin')
+          AND fecha_expiracion IS NOT NULL
+          AND datetime(fecha_expiracion) <= datetime(?)
+    """, (now,))
+    conn.commit()
+    conn.close()
+
+
 @app.get("/admin/resumen")
 def admin_resumen(user=Depends(_current_user)):
     if not _is_admin(user):
         raise HTTPException(status_code=403, detail="Acceso de administrador requerido.")
+    _sync_expired_plans()
     conn=_db()
     usuarios=conn.execute("SELECT COUNT(*) c FROM usuarios").fetchone()['c']
     premium=conn.execute("SELECT COUNT(*) c FROM usuarios WHERE plan != 'gratis' AND plan != 'admin'").fetchone()['c']
@@ -867,11 +883,18 @@ def admin_resumen(user=Depends(_current_user)):
 def admin_usuarios(buscar: str = "", user=Depends(_current_user)):
     if not _is_admin(user):
         raise HTTPException(status_code=403, detail="Acceso de administrador requerido.")
+    _sync_expired_plans()
     q = f"%{buscar.strip()}%"
     conn = _db()
     rows = conn.execute("""
         SELECT u.id, u.usuario, u.correo, u.plan, u.fecha_expiracion,
                u.activo, u.email_verificado,
+               CASE
+                 WHEN u.plan='admin' THEN 'ADMIN'
+                 WHEN u.plan='gratis' AND u.fecha_expiracion IS NOT NULL AND datetime(u.fecha_expiracion) <= datetime('now') THEN 'EXPIRED'
+                 WHEN u.plan='gratis' THEN 'FREE'
+                 ELSE 'ACTIVE'
+               END AS estado_plan,
                (SELECT COUNT(*) FROM historial h WHERE h.usuario=u.usuario) AS historial_count,
                (SELECT COUNT(*) FROM pagos p WHERE p.usuario=u.usuario AND p.estado='PENDING') AS pagos_pendientes
         FROM usuarios u
@@ -908,6 +931,23 @@ def admin_detalle_usuario(usuario: str, user=Depends(_current_user)):
         "pagos": [dict(r) for r in pagos],
         "historial": [dict(r) for r in historial]
     }
+
+@app.post("/admin/usuarios/{usuario}/desactivar")
+def admin_desactivar_plan(usuario: str, user=Depends(_current_user)):
+    if not _is_admin(user):
+        raise HTTPException(status_code=403, detail="Acceso de administrador requerido.")
+    conn = _db()
+    row = conn.execute("SELECT id, plan, fecha_expiracion FROM usuarios WHERE usuario=?", (usuario,)).fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Usuario no encontrado.")
+    if row["plan"] == "admin":
+        conn.close()
+        raise HTTPException(status_code=400, detail="La cuenta administradora no se puede desactivar desde aquí.")
+    conn.execute("UPDATE usuarios SET plan='gratis', fecha_expiracion=NULL WHERE id=?", (row["id"],))
+    conn.execute("DELETE FROM sesiones WHERE usuario_id=?", (row["id"],))
+    conn.commit(); conn.close()
+    return {"ok": True, "mensaje": "Plan desactivado. El usuario conserva su cuenta e historial.", "usuario": usuario, "plan": "gratis", "fecha_expiracion": row["fecha_expiracion"]}
 
 class AdminActivarPlanSchema(BaseModel):
     tipo_plan: str
