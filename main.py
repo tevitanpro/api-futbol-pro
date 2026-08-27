@@ -148,6 +148,7 @@ def _send_email(to_email: str, subject: str, body: str):
         headers={
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json"
+             "User-Agent": "API-Master-Pro/8.8"
         },
         method="POST"
     )
