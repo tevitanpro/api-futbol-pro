@@ -13,6 +13,7 @@ import hashlib
 import hmac
 import json
 import urllib.request
+import urllib.error
 import smtplib
 from email.message import EmailMessage
 from fastapi import Request
@@ -32,6 +33,10 @@ SESSION_DAYS = 7
 EMAIL_VERIFICATION_DAYS = int(os.getenv("EMAIL_VERIFICATION_DAYS", "1"))
 PASSWORD_RESET_MINUTES = int(os.getenv("PASSWORD_RESET_MINUTES", "30"))
 APP_BASE_URL = os.getenv("APP_BASE_URL", "https://api-futbol-pro.onrender.com")
+RESEND_FROM_EMAIL = os.getenv(
+    "RESEND_FROM_EMAIL",
+    "onboarding@resend.dev"
+)
 DEV_SHOW_EMAIL_TOKENS = os.getenv("DEV_SHOW_EMAIL_TOKENS", "0") == "1"
 ADMIN_EMAIL = os.getenv("API_MASTER_ADMIN_EMAIL", "")
 ADMIN_PASSWORD = os.getenv("API_MASTER_ADMIN_PASSWORD", "")
@@ -121,12 +126,14 @@ def _db():
 
 def _send_email(to_email: str, subject: str, body: str):
     api_key = os.getenv("RESEND_API_KEY")
+sender = RESEND_FROM_EMAIL
 
-    if not api_key or not to_email:
+    if not api_key or not to_email or not sender:
+        print("RESEND ERROR: faltan RESEND_API_KEY, destinatario o remitente", flush=True)
         return False
 
     data = json.dumps({
-        "from": "onboarding@resend.dev",
+        "from": sender,
         "to": [to_email],
         "subject": subject,
         "text": body
@@ -144,11 +151,18 @@ def _send_email(to_email: str, subject: str, body: str):
 
     try:
         with urllib.request.urlopen(req, timeout=15) as response:
+            response_body = response.read().decode("utf-8", errors="replace")
+            print(f"RESEND OK: {response.status} {response_body}", flush=True)
             return 200 <= response.status < 300
-    except Exception as e:
-        print(f"RESEND ERROR: {e}")
+   
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode("utf-8", errors="replace")
+        print(f"RESEND ERROR: HTTP {e.code}: {error_body}", flush=True)
         return False
 
+except Exception as e:
+        print(f"RESEND ERROR: {type(e).__name__}: {e}", flush=True)
+        return False
 def _plan_amount(plan_id: str):
     plan = PLANS.get(plan_id)
     if not plan:
