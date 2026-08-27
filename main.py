@@ -12,6 +12,7 @@ import secrets
 import hashlib
 import hmac
 import json
+import urllib.request
 import smtplib
 from email.message import EmailMessage
 from fastapi import Request
@@ -119,23 +120,34 @@ def _db():
     return conn
 
 def _send_email(to_email: str, subject: str, body: str):
-    host = os.getenv("SMTP_HOST")
-    port = int(os.getenv("SMTP_PORT", "587"))
-    user = os.getenv("SMTP_USER")
-    password = os.getenv("SMTP_PASSWORD")
-    sender = os.getenv("SMTP_FROM", user or "")
-    if not (host and user and password and sender and to_email):
+    api_key = os.getenv("RESEND_API_KEY")
+
+    if not api_key or not to_email:
         return False
-    msg = EmailMessage()
-    msg["Subject"] = subject
-    msg["From"] = sender
-    msg["To"] = to_email
-    msg.set_content(body)
-    with smtplib.SMTP(host, port, timeout=15) as smtp:
-        smtp.starttls()
-        smtp.login(user, password)
-        smtp.send_message(msg)
-    return True
+
+    data = json.dumps({
+        "from": "onboarding@resend.dev",
+        "to": [to_email],
+        "subject": subject,
+        "text": body
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        "https://api.resend.com/emails",
+        data=data,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        },
+        method="POST"
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=15) as response:
+            return 200 <= response.status < 300
+    except Exception as e:
+        print(f"RESEND ERROR: {e}")
+        return False
 
 def _plan_amount(plan_id: str):
     plan = PLANS.get(plan_id)
