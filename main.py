@@ -34,6 +34,7 @@ SESSION_DAYS = 7
 EMAIL_VERIFICATION_DAYS = int(os.getenv("EMAIL_VERIFICATION_DAYS", "1"))
 PASSWORD_RESET_MINUTES = int(os.getenv("PASSWORD_RESET_MINUTES", "30"))
 APP_BASE_URL = os.getenv("APP_BASE_URL", "https://api-futbol-pro.onrender.com")
+FRONTEND_URL = os.getenv("FRONTEND_URL", "https://api-futbol-web.vercel.app")
 RESEND_FROM_EMAIL = os.getenv(
     "RESEND_FROM_EMAIL",
     "onboarding@resend.dev"
@@ -502,7 +503,7 @@ def verificar_correo(token: str):
         <p>Tu cuenta de API Master Pro ya está activa.</p>
         <p>Usuario: <span class="user">{row["usuario"]}</span></p>
         <p>Ya puedes iniciar sesión.</p>
-        <a href="{APP_BASE_URL}">Ir a API Master Pro</a>
+        <a href="{FRONTEND_URL}">Ir a API Master Pro</a>
     </div>
 </body>
 </html>
@@ -729,7 +730,7 @@ def resetear_password(data: ResetPasswordSchema):
         <h1>Contraseña actualizada</h1>
         <p>Tu contraseña fue cambiada correctamente.</p>
         <p>Ya puedes iniciar sesión nuevamente.</p>
-        <a href="/">Iniciar sesión</a>
+        <a href="{FRONTEND_URL}">Iniciar sesión</a>
     </div>
 </body>
 </html>
