@@ -31,7 +31,7 @@ PREMIUM_HISTORY_LIMIT = 100
 SESSION_DAYS = 7
 EMAIL_VERIFICATION_DAYS = int(os.getenv("EMAIL_VERIFICATION_DAYS", "1"))
 PASSWORD_RESET_MINUTES = int(os.getenv("PASSWORD_RESET_MINUTES", "30"))
-APP_BASE_URL = os.getenv("APP_BASE_URL", "https://api-futbol-pro.onrender.com")
+APP_BASE_URL = os.getenv("APP_BASE_URL", "https://api-futbol-web.vercel.app")
 DEV_SHOW_EMAIL_TOKENS = os.getenv("DEV_SHOW_EMAIL_TOKENS", "0") == "1"
 ADMIN_EMAIL = os.getenv("API_MASTER_ADMIN_EMAIL", "")
 ADMIN_PASSWORD = os.getenv("API_MASTER_ADMIN_PASSWORD", "")
