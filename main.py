@@ -1243,7 +1243,7 @@ def _bloque_simulacion(iteraciones, marcadores, cdf_marcadores,
     btts_si_count = btts_no_count = 0
     t_over_35 = t_under_35 = t_over_45 = t_under_45 = t_over_55 = t_under_55 = 0
 
-    lineas_corners = [7.5, 8.5, 9.5, 10.5]
+    lineas_corners = [8.5, 9.5, 10.5, 11.5]
     corners_counts = {l: 0 for l in lineas_corners}
     corners_under_counts = {l: 0 for l in lineas_corners}
 
@@ -1318,7 +1318,7 @@ def simular_escenarios_con_pinnacle(
     c_t_mas_35: float = 1.80, c_t_menos_35: float = 2.00,
     c_t_mas_45: float = 2.50, c_t_menos_45: float = 1.50,
     c_t_mas_55: float = 3.50, c_t_menos_55: float = 1.25,
-    c_c_mas_75: float = 1.20, c_c_menos_75: float = 4.00,
+    c_c_mas_115: float = None, c_c_menos_115: float = None,
     c_c_mas_85: float = 1.45, c_c_menos_85: float = 2.60,
     c_c_mas_95: float = 1.85, c_c_menos_95: float = 1.90,
     c_c_mas_105: float = 2.40, c_c_menos_105: float = 1.55,
@@ -1355,7 +1355,7 @@ def simular_escenarios_con_pinnacle(
     p_t55_base, _ = _ajustar_probabilidades_cuota(c_t_mas_55, c_t_menos_55)
 
     corners_bases = {
-        7.5: _ajustar_probabilidades_cuota(c_c_mas_75, c_c_menos_75)[0],
+        11.5: _ajustar_probabilidades_cuota(c_c_mas_115, c_c_menos_115)[0],
         8.5: _ajustar_probabilidades_cuota(c_c_mas_85, c_c_menos_85)[0],
         9.5: _ajustar_probabilidades_cuota(c_c_mas_95, c_c_menos_95)[0],
         10.5: _ajustar_probabilidades_cuota(c_c_mas_105, c_c_menos_105)[0]
@@ -1397,8 +1397,8 @@ def simular_escenarios_con_pinnacle(
     t_over_55 = sum(r[13] for r in resultados_hilos)
     t_under_55 = sum(r[14] for r in resultados_hilos)
 
-    corners_counts = {k: sum(r[15][k] for r in resultados_hilos) for k in [7.5, 8.5, 9.5, 10.5]}
-    corners_under_counts = {k: sum(r[16][k] for r in resultados_hilos) for k in [7.5, 8.5, 9.5, 10.5]}
+    corners_counts = {k: sum(r[15][k] for r in resultados_hilos) for k in [8.5, 9.5, 10.5, 11.5]}
+    corners_under_counts = {k: sum(r[16][k] for r in resultados_hilos) for k in [8.5, 9.5, 10.5, 11.5]}
 
     n = float(total_escenarios)
     sim = {
@@ -1874,8 +1874,8 @@ def jackbusca_partido(
     cuota_tarjetas_mas_55: float = None,
     cuota_tarjetas_menos_55: float = None,
     # Pinnacle córners: todas opcionales.
-    cuota_corners_mas_75: float = None,
-    cuota_corners_menos_75: float = None,
+    cuota_corners_mas_115: float = None,
+    cuota_corners_menos_115: float = None,
     cuota_corners_mas_85: float = None,
     cuota_corners_menos_85: float = None,
     cuota_corners_mas_95: float = None,
@@ -1889,8 +1889,8 @@ def jackbusca_partido(
     casa_tarjetas_menos_45: float = None,
     casa_tarjetas_mas_55: float = None,
     casa_tarjetas_menos_55: float = None,
-    casa_corners_mas_75: float = None,
-    casa_corners_menos_75: float = None,
+    casa_corners_mas_115: float = None,
+    casa_corners_menos_115: float = None,
     casa_corners_mas_85: float = None,
     casa_corners_menos_85: float = None,
     casa_corners_mas_95: float = None,
@@ -1907,7 +1907,7 @@ def jackbusca_partido(
             (5.5, cuota_tarjetas_mas_55, cuota_tarjetas_menos_55),
         ]
         lineas_c = [
-            (7.5, cuota_corners_mas_75, cuota_corners_menos_75),
+            (11.5, cuota_corners_mas_115, cuota_corners_menos_115),
             (8.5, cuota_corners_mas_85, cuota_corners_menos_85),
             (9.5, cuota_corners_mas_95, cuota_corners_menos_95),
             (10.5, cuota_corners_mas_105, cuota_corners_menos_105),
@@ -1935,7 +1935,7 @@ def jackbusca_partido(
         if lam_t is not None:
             tarjetas_mas, tarjetas_menos = _probabilidades_con_lambda_total(lam_t, lineas)
 
-        corners_lineas = [7.5, 8.5, 9.5, 10.5]
+        corners_lineas = [8.5, 9.5, 10.5, 11.5]
         corners_mas = corners_menos = {}
         if lam_c is not None:
             corners_mas, corners_menos = _probabilidades_con_lambda_total(lam_c, corners_lineas)
@@ -1952,7 +1952,7 @@ def jackbusca_partido(
 
         if lam_c is not None:
             for linea, over, under, casa_o, casa_u in [
-                (7.5, cuota_corners_mas_75, cuota_corners_menos_75, casa_corners_mas_75, casa_corners_menos_75),
+                (11.5, cuota_corners_mas_115, cuota_corners_menos_115, casa_corners_mas_115, casa_corners_menos_115),
                 (8.5, cuota_corners_mas_85, cuota_corners_menos_85, casa_corners_mas_85, casa_corners_menos_85),
                 (9.5, cuota_corners_mas_95, cuota_corners_menos_95, casa_corners_mas_95, casa_corners_menos_95),
                 (10.5, cuota_corners_mas_105, cuota_corners_menos_105, casa_corners_mas_105, casa_corners_menos_105),
@@ -2360,8 +2360,8 @@ def unificado_partido(
     cuota_tarjetas_menos_45: float = None,
     cuota_tarjetas_mas_55: float = None,
     cuota_tarjetas_menos_55: float = None,
-    cuota_corners_mas_75: float = None,
-    cuota_corners_menos_75: float = None,
+    cuota_corners_mas_115: float = None,
+    cuota_corners_menos_115: float = None,
     cuota_corners_mas_85: float = None,
     cuota_corners_menos_85: float = None,
     cuota_corners_mas_95: float = None,
@@ -2388,8 +2388,8 @@ def unificado_partido(
             c_t_menos_45=cuota_tarjetas_menos_45 or 1.50,
             c_t_mas_55=cuota_tarjetas_mas_55 or 3.50,
             c_t_menos_55=cuota_tarjetas_menos_55 or 1.25,
-            c_c_mas_75=cuota_corners_mas_75 or 1.20,
-            c_c_menos_75=cuota_corners_menos_75 or 4.00,
+            c_c_mas_115=cuota_corners_mas_115,
+            c_c_menos_115=cuota_corners_menos_115,
             c_c_mas_85=cuota_corners_mas_85 or 1.45,
             c_c_menos_85=cuota_corners_menos_85 or 2.60,
             c_c_mas_95=cuota_corners_mas_95 or 1.85,
@@ -2410,8 +2410,8 @@ def unificado_partido(
             cuota_tarjetas_menos_45=cuota_tarjetas_menos_45,
             cuota_tarjetas_mas_55=cuota_tarjetas_mas_55,
             cuota_tarjetas_menos_55=cuota_tarjetas_menos_55,
-            cuota_corners_mas_75=cuota_corners_mas_75,
-            cuota_corners_menos_75=cuota_corners_menos_75,
+            cuota_corners_mas_115=cuota_corners_mas_115,
+            cuota_corners_menos_115=cuota_corners_menos_115,
             cuota_corners_mas_85=cuota_corners_mas_85,
             cuota_corners_menos_85=cuota_corners_menos_85,
             cuota_corners_mas_95=cuota_corners_mas_95,
