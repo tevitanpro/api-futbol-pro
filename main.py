@@ -1,4 +1,4 @@
-rom fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import random
@@ -22,7 +22,7 @@ from fastapi.responses import HTMLResponse
 app = FastAPI(
     title="API Master Pro - Pinnacle Optimized Edition",
     description="Motor de simulación matemática avanzada de 50,000 escenarios con base de datos e historial",
-    version="9.0.0"
+    version="8.8.0"
 )
 
 # ==========================================
@@ -447,6 +447,7 @@ def verificar_correo(token: str):
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="refresh" content="4;url={FRONTEND_URL}">
     <title>Correo verificado - API Master Pro</title>
     <style>
         body {{
@@ -503,8 +504,14 @@ def verificar_correo(token: str):
         <p>Tu cuenta de API Master Pro ya está activa.</p>
         <p>Usuario: <span class="user">{row["usuario"]}</span></p>
         <p>Ya puedes iniciar sesión.</p>
+        <p style="font-size:13px;color:#94a3b8;">Serás redirigido automáticamente en unos segundos...</p>
         <a href="{FRONTEND_URL}">Ir a API Master Pro</a>
     </div>
+    <script>
+        setTimeout(function() {{
+            window.location.replace({json.dumps(FRONTEND_URL)});
+        }}, 4000);
+    </script>
 </body>
 </html>
 """)
@@ -1704,31 +1711,17 @@ def analizar_partido(
         return {"error": f"Error en el servidor: {str(e)}"}
 
 # ==========================================
-# JACKBUSCA V3 + MOTOR UNIFICADO v9.0
+# JACKBUSCA V8.4 - MOTOR INDEPENDIENTE Y FLEXIBLE
 # ==========================================
-# OBJETIVO:
-#   JackBusca genera una señal PREDICTIVA específica de córners/tarjetas.
-#   EV/Edge NO decide la señal predictiva.
-#   El Unificado compara el vector del Principal con el de JackBusca.
-#
-# COMPATIBILIDAD:
-#   Se mantienen los nombres de la ruta /jackbusca/partido y sus parámetros.
-#   Las claves antiguas de respuesta también se conservan.
-#
-# REGLA:
-#   Si no hay datos suficientes, no se inventa una señal.
-#   La cuota de la casa solo entra en una capa separada de valor.
-# ==========================================
-
-# Referencia estadística obtenida del dataset LaLiga de 4.180 partidos
-# usado durante la calibración offline. Son PRIORS, no resultados futuros.
-JACKBUSCA_LALIGA_PRIOR = {
-    "corners_mean": 9.5038277512,
-    "cards_mean": 4.8866028708,
-}
-
-JACK_MIN_CONFIDENCE = 65.0
-JACK_HIGH_CONFIDENCE = 80.0
+# Principios:
+# 1) Ningún dato es obligatorio salvo que se quiera analizar ese bloque.
+# 2) Nunca se inventan cuotas ni promedios faltantes.
+# 3) Tarjetas: el promedio del árbitro es una señal fuerte, pero opcional.
+# 4) Córners: se puede inferir la distribución desde líneas O/U de Pinnacle,
+#    sin exigir promedios por equipo.
+# 5) Las cuotas de la casa donde se apuesta son opcionales y SOLO sirven
+#    para valorar una oportunidad (Edge/EV); no alteran el modelo.
+# 6) Si faltan datos suficientes, el motor informa "DATOS INSUFICIENTES".
 
 
 def _cuota_valida(c):
@@ -1753,284 +1746,118 @@ def _poisson_cdf_leq(lam, k):
 
 
 def _poisson_over(lam, linea):
+    # Para líneas .5, Over 3.5 equivale a P(X >= 4).
     k = int(math.floor(linea))
-    return 1.0 - _poisson_cdf_leq(max(float(lam), 0.01), k)
+    return 1.0 - _poisson_cdf_leq(lam, k)
 
 
 def _ajustar_lambda_a_linea(lam_inicial, objetivos):
-    """Ajusta lambda a las probabilidades O/U disponibles."""
+    """Encuentra lambda que minimiza el error frente a líneas O/U disponibles."""
     if not objetivos:
         return None, None
     mejor_lam, mejor_err = None, float('inf')
     for i in range(20, 251):
-        lam = i / 20.0
-        err = sum((_poisson_over(lam, linea) - p_over) ** 2
-                  for linea, p_over in objetivos)
+        lam = i / 20.0  # 1.0 .. 12.5
+        err = 0.0
+        for linea, p_over in objetivos:
+            err += (_poisson_over(lam, linea) - p_over) ** 2
         if err < mejor_err:
             mejor_lam, mejor_err = lam, err
     return mejor_lam, mejor_err
 
 
 def _lambda_corners_desde_mercado(lineas):
+    """Infiere lambda total de córners usando solo las líneas O/U disponibles."""
     objetivos = []
     for linea, over, under in lineas:
-        po, _ = _prob_2way_opcional(over, under)
+        po, pu = _prob_2way_opcional(over, under)
         if po is not None:
             objetivos.append((float(linea), po))
     if not objetivos:
         return None, None, 0
-    lam, err = _ajustar_lambda_a_linea(JACKBUSCA_LALIGA_PRIOR["corners_mean"], objetivos)
+    lam, err = _ajustar_lambda_a_linea(9.5, objetivos)
     return lam, err, len(objetivos)
 
 
-def _lambda_tarjetas_v3(promedio_arbitro, lineas):
+def _probabilidades_con_lambda_total(lam, lineas):
+    salida_mas, salida_menos = {}, {}
+    for linea in lineas:
+        salida_mas[linea] = round(_poisson_over(lam, linea) * 100.0, 1)
+        salida_menos[linea] = round((1.0 - _poisson_over(lam, linea)) * 100.0, 1)
+    return salida_mas, salida_menos
+
+
+def _lambda_tarjetas(promedio_arbitro, lineas):
+    """Combina promedio del árbitro (si existe) con líneas O/U disponibles.
+    Si existe el promedio, tiene mayor peso; si no, se intenta inferir desde mercado."""
     objetivos = []
     for linea, over, under in lineas:
-        po, _ = _prob_2way_opcional(over, under)
+        po, pu = _prob_2way_opcional(over, under)
         if po is not None:
             objetivos.append((float(linea), po))
 
-    lam_mercado, err_mercado = _ajustar_lambda_a_linea(
-        JACKBUSCA_LALIGA_PRIOR["cards_mean"], objetivos
-    ) if objetivos else (None, None)
+    lam_mercado, err_mercado = _ajustar_lambda_a_linea(4.5, objetivos) if objetivos else (None, None)
 
-    # Si hay árbitro, se mantiene como señal fuerte.
     if promedio_arbitro is not None and promedio_arbitro > 0:
         if lam_mercado is not None:
+            # Promedio arbitral = señal principal; mercado = calibración secundaria.
             lam = 0.70 * float(promedio_arbitro) + 0.30 * lam_mercado
-            confianza = 85.0 if len(objetivos) >= 2 else 78.0
-            fuente = "PROMEDIO ÁRBITRO + MERCADO O/U"
+            confianza = 0.85 if len(objetivos) >= 2 else 0.78
         else:
             lam = float(promedio_arbitro)
-            confianza = 70.0
-            fuente = "PROMEDIO ÁRBITRO"
-        return lam, confianza, fuente, err_mercado, len(objetivos)
+            confianza = 0.70
+        return lam, confianza, 'PROMEDIO ÁRBITRO' + (' + MERCADO' if lam_mercado is not None else '')
 
     if lam_mercado is not None:
-        # Con 3 líneas completas hay evidencia suficiente de mercado.
-        confianza = 68.0 if len(objetivos) >= 3 else 58.0
-        return lam_mercado, confianza, "MERCADO O/U", err_mercado, len(objetivos)
+        confianza = 0.68 if len(objetivos) >= 3 else 0.58
+        return lam_mercado, confianza, 'MERCADO O/U'
 
-    # Fallback estadístico: solo prior de LaLiga, marcado como referencia.
-    return JACKBUSCA_LALIGA_PRIOR["cards_mean"], 50.0, "PRIOR HISTÓRICO LALIGA (REFERENCIA)", None, 0
+    return None, 0.0, 'SIN DATOS'
 
 
-def _confianza_corners_v3(n_lineas, tiene_promedio):
-    if n_lineas >= 4:
-        return 75.0
-    if n_lineas >= 3:
-        return 68.0
-    if n_lineas >= 2:
-        return 65.0
-    if n_lineas == 1 or tiene_promedio:
-        return 58.0
-    return 0.0
-
-
-def _nivel_confianza_jack(conf):
-    conf = float(conf)
-    if conf >= 80:
-        return "MUY ALTA"
-    if conf >= 75:
-        return "ALTA"
-    if conf >= 70:
-        return "MEDIA"
-    if conf >= 65:
-        return "BAJA"
-    return "NO RECOMENDADA"
-
-
-def _vector_jackbusca(mercados, confianza_corners, confianza_tarjetas):
-    """Vector puro de señal; no usa EV/Edge para decidir dirección."""
-    validos = [m for m in mercados if m and m.get("confianza", 0) >= JACK_MIN_CONFIDENCE]
-
-    def best_for(prefix):
-        candidatos = [m for m in validos if m["nombre"].startswith(prefix)]
-        if not candidatos:
-            return None
-        return max(candidatos, key=lambda m: (
-            m.get("confianza", 0),
-            abs(float(m.get("probabilidad", 50)) - 50)
-        ))
-
-    bc = best_for("Más ")  # se reemplaza abajo por selección por mercado
-    corners = [m for m in validos if "Córners" in m["nombre"]]
-    cards = [m for m in validos if "Tarjetas" in m["nombre"]]
-
-    def best(items):
-        return max(items, key=lambda m: (
-            m.get("confianza", 0),
-            abs(float(m.get("probabilidad", 50)) - 50)
-        )) if items else None
-
-    bc = best(corners)
-    bt = best(cards)
-
-    def signal(m):
-        if not m:
-            return "SIN_DATOS"
-        return "OVER" if m["nombre"].startswith("Más ") else "UNDER"
-
-    actividad = []
-    if bc:
-        actividad.append("ALTA" if signal(bc) == "OVER" else "BAJA")
-    if bt:
-        actividad.append("ALTA" if signal(bt) == "OVER" else "BAJA")
-
-    if len(actividad) == 2 and actividad[0] == actividad[1]:
-        escenario = "ACTIVIDAD ALTA" if actividad[0] == "ALTA" else "ACTIVIDAD BAJA"
-    elif actividad:
-        escenario = "ACTIVIDAD MIXTA"
-    else:
-        escenario = "SIN DATOS"
-
-    return {
-        "corners": {
-            "direccion": signal(bc),
-            "seleccion": bc["nombre"] if bc else None,
-            "linea": bc.get("linea") if bc else None,
-            "confianza": bc.get("confianza") if bc else 0.0,
-        },
-        "tarjetas": {
-            "direccion": signal(bt),
-            "seleccion": bt["nombre"] if bt else None,
-            "linea": bt.get("linea") if bt else None,
-            "confianza": bt.get("confianza") if bt else 0.0,
-        },
-        "escenario_actividad": escenario,
-        "confianza_global": round(
-            max([x for x in [confianza_corners, confianza_tarjetas] if x is not None] or [0.0]), 1
-        ),
-    }
-
-
-def _vector_principal(sim):
-    """Vector del motor principal, independiente del EV/Edge."""
-    p1, px, p2 = sim.get("p_1", 0), sim.get("p_x", 0), sim.get("p_2", 0)
-    if max(p1, px, p2) < 55:
-        resultado = "NEUTRO"
-    elif p1 == max(p1, px, p2):
-        resultado = "LOCAL"
-    elif p2 == max(p1, px, p2):
-        resultado = "VISITANTE"
-    else:
-        resultado = "EMPATE"
-
-    goles_over = sim.get("over_25", 0)
-    goles_under = sim.get("under_25", 0)
-    if max(goles_over, goles_under) < 55:
-        goles = "NEUTRO"
-    else:
-        goles = "OVER 2.5" if goles_over >= goles_under else "UNDER 2.5"
-
-    btts = "BTTS SI" if sim.get("btts_si", 0) >= sim.get("btts_no", 0) else "BTTS NO"
-    return {
-        "resultado": resultado,
-        "goles": goles,
-        "btts": btts,
-        "confianza_resultado": round(max(p1, px, p2), 1),
-        "confianza_goles": round(max(goles_over, goles_under), 1),
-        "confianza_btts": round(max(sim.get("btts_si", 0), sim.get("btts_no", 0)), 1),
-    }
-
-
-def _unificar_vectores(vector_principal, vector_jack):
-    """
-    Clasificación deliberadamente conservadora:
-      - COMPLEMENTARIEDAD: dominios distintos, ambos con señal >=65.
-      - CONFLUENCIA: además de complementariedad, el contexto apunta en la misma dirección.
-      - CONTRADICCIÓN: solo si existe una dirección comparable opuesta.
-      - NEUTRO: señales insuficientes.
-    """
-    jc = vector_jack["corners"]
-    jt = vector_jack["tarjetas"]
-    principal_fuerte = max(
-        vector_principal.get("confianza_resultado", 0),
-        vector_principal.get("confianza_goles", 0),
-        vector_principal.get("confianza_btts", 0)
-    ) >= JACK_MIN_CONFIDENCE
-    jack_fuerte = vector_jack.get("confianza_global", 0) >= JACK_MIN_CONFIDENCE
-
-    if not principal_fuerte and not jack_fuerte:
-        return {
-            "clasificacion": "NEUTRO",
-            "confianza": 0.0,
-            "motivo": "Ninguno de los dos vectores alcanza la confianza mínima."
-        }
-
-    # Los mercados de JackBusca son córners/tarjetas y no son directamente
-    # comparables con 1X2/goles/BTTS; por eso, por defecto, su relación es complementaria.
-    if principal_fuerte and jack_fuerte:
-        # Actividad alta + goles Over o BTTS Sí => confluencia contextual.
-        actividad = vector_jack.get("escenario_actividad")
-        goles = vector_principal.get("goles")
-        btts = vector_principal.get("btts")
-        if actividad == "ACTIVIDAD ALTA" and (goles == "OVER 2.5" or btts == "BTTS SI"):
-            return {
-                "clasificacion": "CONFLUENCIA",
-                "confianza": round(min(
-                    vector_jack["confianza_global"],
-                    max(vector_principal["confianza_goles"], vector_principal["confianza_btts"])
-                ), 1),
-                "motivo": "Principal proyecta mayor actividad ofensiva y JackBusca detecta actividad alta."
-            }
-        if actividad == "ACTIVIDAD BAJA" and (goles == "UNDER 2.5" and btts == "BTTS NO"):
-            return {
-                "clasificacion": "CONFLUENCIA",
-                "confianza": round(min(
-                    vector_jack["confianza_global"],
-                    max(vector_principal["confianza_goles"], vector_principal["confianza_btts"])
-                ), 1),
-                "motivo": "Principal proyecta baja actividad ofensiva y JackBusca detecta actividad baja."
-            }
-        return {
-            "clasificacion": "COMPLEMENTARIEDAD",
-            "confianza": round(min(vector_jack["confianza_global"], max(
-                vector_principal["confianza_resultado"],
-                vector_principal["confianza_goles"],
-                vector_principal["confianza_btts"]
-            )), 1),
-            "motivo": "Ambos motores aportan señales útiles en mercados diferentes sin contradicción directa."
-        }
-
-    return {
-        "clasificacion": "NEUTRO",
-        "confianza": round(max(
-            vector_jack.get("confianza_global", 0),
-            vector_principal.get("confianza_resultado", 0),
-            vector_principal.get("confianza_goles", 0),
-            vector_principal.get("confianza_btts", 0)
-        ), 1),
-        "motivo": "Solo uno de los motores alcanza la confianza mínima; no se fuerza una relación."
-    }
-
-
-def _evaluar_mercado_jack_v3(nombre, prob_modelo, cuota_ref=None, cuota_casa=None,
-                             confianza=0.0, nota=''):
+def _evaluar_mercado_jack(nombre, prob_modelo, cuota_ref, cuota_casa, confianza, nota=''):
     if prob_modelo is None:
         return None
-    conf = float(confianza)
+    p = prob_modelo / 100.0
     resultado = {
-        "nombre": nombre,
-        "probabilidad": round(float(prob_modelo), 1),
-        "cuota_pinnacle": cuota_ref,
-        "cuota_casa": cuota_casa,
-        "confianza": round(conf, 1),
-        "nivel_confianza": _nivel_confianza_jack(conf),
-        "edge": None,
-        "ev": None,
-        "nivel": "SEÑAL PREDICTIVA",
-        "accion": "RECOMENDADO" if conf >= JACK_MIN_CONFIDENCE else "NO RECOMENDADA",
-        "explicacion": nota or "Señal predictiva independiente de EV/Edge."
+        'nombre': nombre,
+        'probabilidad': round(prob_modelo, 1),
+        'cuota_pinnacle': cuota_ref,
+        'cuota_casa': cuota_casa,
+        'confianza': round(confianza * 100.0, 1),
+        'edge': None,
+        'ev': None,
+        'nivel': 'SIN CUOTA DE APUESTA',
+        'accion': 'NO EVALUABLE',
+        'explicacion': nota or 'Probabilidad calculada, pero falta la cuota de la casa donde se apuesta.'
     }
-    # EV/Edge queda disponible solo como información secundaria, nunca modifica accion.
     if _cuota_valida(cuota_casa):
-        p = max(0.0, min(1.0, float(prob_modelo) / 100.0))
+        # Para una sola cuota, la probabilidad implícita directa es 1/cuota.
+        # No se usa como calibración del modelo; solo como precio de apuesta.
         p_casa = 1.0 / cuota_casa
-        resultado["probabilidad_implicita_casa"] = round(p_casa * 100.0, 1)
-        resultado["edge"] = round((p - p_casa) * 100.0, 1)
-        resultado["ev"] = round((p * cuota_casa - 1.0) * 100.0, 2)
-        resultado["nivel_valor"] = "VALOR INFORMATIVO"
+        edge = (p - p_casa) * 100.0
+        ev = (p * cuota_casa - 1.0) * 100.0
+        score = ev * confianza
+        if ev >= 5 and edge >= 3:
+            nivel, accion = 'VALOR FUERTE', 'RECOMENDADO'
+        elif ev >= 3 and edge >= 1.5:
+            nivel, accion = 'VALOR BUENO', 'RECOMENDADO'
+        elif ev >= 1.5 and edge >= 1:
+            nivel, accion = 'VALOR LEVE', 'RECOMENDACIÓN CAUTELOSA'
+        else:
+            nivel, accion = 'SIN VALOR SUFICIENTE', 'NO RECOMENDADO'
+        resultado.update({
+            'probabilidad_implicita_casa': round(p_casa * 100.0, 1),
+            'edge': round(edge, 1),
+            'ev': round(ev, 2),
+            'score_valor': round(score, 2),
+            'nivel': nivel,
+            'accion': accion,
+            'explicacion': (
+                f'El modelo estima {prob_modelo:.1f}% y la cuota de la casa {cuota_casa:.2f} '
+                f'implica {p_casa*100:.1f}%. Edge {edge:+.1f}% y EV {ev:+.2f}%. {nota}'
+            ).strip()
+        })
     return resultado
 
 
@@ -2039,12 +1866,14 @@ def jackbusca_partido(
     request: Request,
     promedio_tarjetas_arbitro: float = None,
     promedio_esperado_corners: float = None,
+    # Pinnacle tarjetas: todas opcionales.
     cuota_tarjetas_mas_35: float = None,
     cuota_tarjetas_menos_35: float = None,
     cuota_tarjetas_mas_45: float = None,
     cuota_tarjetas_menos_45: float = None,
     cuota_tarjetas_mas_55: float = None,
     cuota_tarjetas_menos_55: float = None,
+    # Pinnacle córners: todas opcionales.
     cuota_corners_mas_75: float = None,
     cuota_corners_menos_75: float = None,
     cuota_corners_mas_85: float = None,
@@ -2053,6 +1882,7 @@ def jackbusca_partido(
     cuota_corners_menos_95: float = None,
     cuota_corners_mas_105: float = None,
     cuota_corners_menos_105: float = None,
+    # Cuotas de la casa donde apuesta el usuario: opcionales.
     casa_tarjetas_mas_35: float = None,
     casa_tarjetas_menos_35: float = None,
     casa_tarjetas_mas_45: float = None,
@@ -2067,10 +1897,10 @@ def jackbusca_partido(
     casa_corners_menos_95: float = None,
     casa_corners_mas_105: float = None,
     casa_corners_menos_105: float = None,
+    internal_unificado: bool = False,
 ):
     try:
         _require_premium(request)
-
         lineas_t = [
             (3.5, cuota_tarjetas_mas_35, cuota_tarjetas_menos_35),
             (4.5, cuota_tarjetas_mas_45, cuota_tarjetas_menos_45),
@@ -2083,11 +1913,11 @@ def jackbusca_partido(
             (10.5, cuota_corners_mas_105, cuota_corners_menos_105),
         ]
 
-        lam_t, conf_t, fuente_t, err_t, n_t = _lambda_tarjetas_v3(
-            promedio_tarjetas_arbitro, lineas_t
-        )
+        lam_t, conf_t, fuente_t = _lambda_tarjetas(promedio_tarjetas_arbitro, lineas_t)
         lam_c, err_c, n_c = _lambda_corners_desde_mercado(lineas_c)
 
+        # Si el usuario aporta promedio de córners, se puede usar como señal secundaria,
+        # pero nunca es obligatorio. El mercado sigue teniendo prioridad si existe.
         if lam_c is not None and promedio_esperado_corners is not None and promedio_esperado_corners > 0:
             lam_c = 0.75 * lam_c + 0.25 * float(promedio_esperado_corners)
             fuente_c = 'MERCADO O/U + PROMEDIO'
@@ -2100,36 +1930,25 @@ def jackbusca_partido(
         else:
             fuente_c = 'SIN DATOS'
 
-        conf_c = _confianza_corners_v3(
-            n_c, promedio_esperado_corners is not None and promedio_esperado_corners > 0
-        )
-
-        lineas_tarjetas = [3.5, 4.5, 5.5]
-        tarjetas_mas, tarjetas_menos = ({}, {})
+        lineas = [3.5, 4.5, 5.5]
+        tarjetas_mas = tarjetas_menos = {}
         if lam_t is not None:
-            tarjetas_mas, tarjetas_menos = _probabilidades_con_lambda_total(lam_t, lineas_tarjetas)
+            tarjetas_mas, tarjetas_menos = _probabilidades_con_lambda_total(lam_t, lineas)
 
-        lineas_corners = [7.5, 8.5, 9.5, 10.5]
-        corners_mas, corners_menos = ({}, {})
+        corners_lineas = [7.5, 8.5, 9.5, 10.5]
+        corners_mas = corners_menos = {}
         if lam_c is not None:
-            corners_mas, corners_menos = _probabilidades_con_lambda_total(lam_c, lineas_corners)
+            corners_mas, corners_menos = _probabilidades_con_lambda_total(lam_c, corners_lineas)
 
         mercados = []
-
         if lam_t is not None:
             for linea, over, under, casa_o, casa_u in [
                 (3.5, cuota_tarjetas_mas_35, cuota_tarjetas_menos_35, casa_tarjetas_mas_35, casa_tarjetas_menos_35),
                 (4.5, cuota_tarjetas_mas_45, cuota_tarjetas_menos_45, casa_tarjetas_mas_45, casa_tarjetas_menos_45),
                 (5.5, cuota_tarjetas_mas_55, cuota_tarjetas_menos_55, casa_tarjetas_mas_55, casa_tarjetas_menos_55),
             ]:
-                mercados.append(_evaluar_mercado_jack_v3(
-                    f'Más {linea} Tarjetas', tarjetas_mas[linea], over, casa_o, conf_t,
-                    f'Fuente: {fuente_t}. EV/Edge no modifica esta señal.'
-                ))
-                mercados.append(_evaluar_mercado_jack_v3(
-                    f'Menos {linea} Tarjetas', tarjetas_menos[linea], under, casa_u, conf_t,
-                    f'Fuente: {fuente_t}. EV/Edge no modifica esta señal.'
-                ))
+                mercados.append(_evaluar_mercado_jack(f'Más {linea} Tarjetas', tarjetas_mas[linea], over, casa_o, conf_t, f'Fuente: {fuente_t}.'))
+                mercados.append(_evaluar_mercado_jack(f'Menos {linea} Tarjetas', tarjetas_menos[linea], under, casa_u, conf_t, f'Fuente: {fuente_t}.'))
 
         if lam_c is not None:
             for linea, over, under, casa_o, casa_u in [
@@ -2138,98 +1957,390 @@ def jackbusca_partido(
                 (9.5, cuota_corners_mas_95, cuota_corners_menos_95, casa_corners_mas_95, casa_corners_menos_95),
                 (10.5, cuota_corners_mas_105, cuota_corners_menos_105, casa_corners_mas_105, casa_corners_menos_105),
             ]:
-                mercados.append(_evaluar_mercado_jack_v3(
-                    f'Más {linea} Córners', corners_mas[linea], over, casa_o, conf_c,
-                    f'Fuente: {fuente_c}. EV/Edge no modifica esta señal.'
-                ))
-                mercados.append(_evaluar_mercado_jack_v3(
-                    f'Menos {linea} Córners', corners_menos[linea], under, casa_u, conf_c,
-                    f'Fuente: {fuente_c}. EV/Edge no modifica esta señal.'
-                ))
+                mercados.append(_evaluar_mercado_jack(f'Más {linea} Córners', corners_mas[linea], over, casa_o, 0.68 if n_c >= 3 else 0.58, f'Fuente: {fuente_c}.'))
+                mercados.append(_evaluar_mercado_jack(f'Menos {linea} Córners', corners_menos[linea], under, casa_u, 0.68 if n_c >= 3 else 0.58, f'Fuente: {fuente_c}.'))
 
         mercados = [m for m in mercados if m]
-
-        # Top 3 PREDICTIVO: confianza primero; luego separación del 50%.
-        predictivos = [m for m in mercados if m["confianza"] >= JACK_MIN_CONFIDENCE]
-        predictivos.sort(key=lambda x: (
-            x["confianza"], abs(x["probabilidad"] - 50)
-        ), reverse=True)
-        top3 = predictivos[:3]
-
-        vector_jack = _vector_jackbusca(mercados, conf_c, conf_t)
+        recomendables = [m for m in mercados if m['accion'] in ('RECOMENDADO', 'RECOMENDACIÓN CAUTELOSA')]
+        recomendables.sort(key=lambda x: x.get('score_valor', -999), reverse=True)
 
         bloques = []
         if lam_t is None:
-            bloques.append("Tarjetas: DATOS INSUFICIENTES.")
+            bloques.append('Tarjetas: DATOS INSUFICIENTES. Aporta promedio del árbitro o al menos una línea O/U completa de tarjetas.')
         if lam_c is None:
-            bloques.append("Córners: DATOS INSUFICIENTES.")
+            bloques.append('Córners: DATOS INSUFICIENTES. No se inventó un promedio; aporta una línea O/U de Pinnacle o, si la conoces, una media de córners.')
         if not bloques:
-            bloques.append("Datos suficientes para generar señal en ambos bloques.")
+            bloques.append('Datos suficientes para ambos bloques.')
 
         usuario_actual = _optional_user(request)
-        historial_info = _save_analysis_if_allowed(
-            usuario_actual,
-            "JackBusca V3 | Tarjetas y Córners",
-            {
-                "vector_jackbusca": vector_jack,
-                "top_3_selecciones": top3,
-                "estado_recomendacion": "HAY SEÑAL" if top3 else "NO RECOMENDADA"
-            }
+        historial_info = (
+            _save_analysis_if_allowed(
+                usuario_actual,
+                "JackBusca | Tarjetas y Córners",
+                {"arbitraje": {"lambda_tarjetas": lam_t, "fuente": fuente_t}, "corners": {"lambda_total": lam_c, "fuente": fuente_c}, "top_3_recomendaciones": recomendables[:3], "estado_recomendacion": 'HAY VALOR DETECTADO' if recomendables else 'NO RECOMENDACIÓN'}
+            )
+            if not internal_unificado else
+            {"guardado": False, "motivo": "integrado_en_unificado"}
         )
 
         return {
-            "origen": "JackBusca V3 - Motor predictivo de Tarjetas y Córners",
-            "version_motor": "V3.0",
-            "regla_datos": "La señal predictiva NO depende de EV/Edge. No se inventan cuotas.",
-            "calibracion": {
-                "dataset_referencia": "LaLiga | 4.180 partidos",
-                "prior_corners": JACKBUSCA_LALIGA_PRIOR["corners_mean"],
-                "prior_tarjetas": JACKBUSCA_LALIGA_PRIOR["cards_mean"],
-                "nota": "Los priors son referencia histórica offline; las cuotas O/U actuales y el árbitro, si existen, aportan la señal del partido."
+            'origen': 'JackBusca v8.4 - modelo flexible de Tarjetas y Córners',
+            'regla_datos': 'Los datos son opcionales; el motor nunca inventa cuotas ni promedios faltantes.',
+            'arbitraje': {
+                'promedio_tarjetas_referencia': promedio_tarjetas_arbitro,
+                'lambda_tarjetas': round(lam_t, 3) if lam_t is not None else None,
+                'fuente': fuente_t,
+                'confianza': round(conf_t * 100.0, 1)
             },
-            "arbitraje": {
-                "promedio_tarjetas_referencia": promedio_tarjetas_arbitro,
-                "lambda_tarjetas": round(lam_t, 3) if lam_t is not None else None,
-                "fuente": fuente_t,
-                "confianza": round(conf_t, 1) if lam_t is not None else 0.0
+            'corners': {
+                'promedio_aportado': promedio_esperado_corners,
+                'lambda_total': round(lam_c, 3) if lam_c is not None else None,
+                'lineas_pinnacle_disponibles': n_c,
+                'fuente': fuente_c,
+                'error_calibracion': round(err_c, 5) if err_c is not None else None,
+                'confianza': round((0.68 if n_c >= 3 else 0.58) * 100.0, 1) if lam_c is not None else 0.0
             },
-            "corners": {
-                "promedio_aportado": promedio_esperado_corners,
-                "lambda_total": round(lam_c, 3) if lam_c is not None else None,
-                "lineas_pinnacle_disponibles": n_c,
-                "fuente": fuente_c,
-                "error_calibracion": round(err_c, 5) if err_c is not None else None,
-                "confianza": round(conf_c, 1)
-            },
-            "mercados_tarjetas_explicados": ({
-                f'mas_de_{x}': f'{tarjetas_mas[x]}%' for x in lineas_tarjetas
+            'mercados_tarjetas_explicados': ({
+                f'mas_de_{x}': f'{tarjetas_mas[x]}%' for x in lineas
             } | {
-                f'menos_de_{x}': f'{tarjetas_menos[x]}%' for x in lineas_tarjetas
+                f'menos_de_{x}': f'{tarjetas_menos[x]}%' for x in lineas
             }) if lam_t is not None else {},
-            "mercados_tiros_de_esquina": {
-                "mas_de": {str(x): f'{corners_mas[x]}%' for x in lineas_corners} if lam_c is not None else {},
-                "menos_de": {str(x): f'{corners_menos[x]}%' for x in lineas_corners} if lam_c is not None else {}
+            'mercados_tiros_de_esquina': {
+                'mas_de': {str(x): f'{corners_mas[x]}%' for x in corners_lineas} if lam_c is not None else {},
+                'menos_de': {str(x): f'{corners_menos[x]}%' for x in corners_lineas} if lam_c is not None else {}
             },
-            "mercados_valor": mercados,
-            "top_3_recomendaciones": top3,
-            "top_3_selecciones": top3,
-            "estado_recomendacion": "HAY SEÑAL" if top3 else "NO RECOMENDADA",
-            "explicacion": " ".join(bloques) + " Si la confianza es menor de 65%, la selección aparece como NO RECOMENDADA.",
-            "vector_jackbusca": vector_jack,
-            "escenarios": 50000,
-            "historial_info": historial_info
+            'mercados_valor': mercados,
+            'top_3_recomendaciones': recomendables[:3],
+            'estado_recomendacion': 'HAY VALOR DETECTADO' if recomendables else 'NO RECOMENDACIÓN',
+            'explicacion': ' '.join(bloques) + (' Si ninguna cuota de la casa fue introducida, se muestran probabilidades pero no se fuerza una recomendación de valor.' if mercados else ''),
+            'escenarios': 50000,
+            'historial_info': historial_info
         }
-
     except HTTPException:
         raise
     except Exception as e:
-        return {'error': f'Error en JackBusca V3: {str(e)}'}
+        return {'error': f'Error en JackBusca: {str(e)}'}
+# ==========================================
+# MOTOR UNIFICADO PREDICTIVO v2
+# Une los vectores del Motor Principal y JackBusca.
+# IMPORTANTE: esta capa NO usa EV/Edge para decidir
+# la lectura predictiva. Las cuotas de la casa siguen
+# siendo una capa independiente de valor.
+# ==========================================
+
+UNIFICADO_MIN_CONFIDENCE = 65.0
 
 
-# ==========================================
-# MOTOR UNIFICADO
-# ==========================================
-@app.get('/unificado/partido')
+def _u_clip(value, low=0.0, high=100.0):
+    try:
+        return max(low, min(high, float(value)))
+    except (TypeError, ValueError):
+        return low
+
+
+def _u_side_from_1x2(sim):
+    opciones = [
+        ("Victoria Local", float(sim.get("p_1", 0.0) or 0.0)),
+        ("Empate", float(sim.get("p_x", 0.0) or 0.0)),
+        ("Victoria Visitante", float(sim.get("p_2", 0.0) or 0.0)),
+    ]
+    return max(opciones, key=lambda x: x[1])
+
+
+def _u_goal_signal(sim):
+    over = float(sim.get("over_25", 0.0) or 0.0)
+    under = float(sim.get("under_25", 0.0) or 0.0)
+    btts_si = float(sim.get("btts_si", 0.0) or 0.0)
+    btts_no = float(sim.get("btts_no", 0.0) or 0.0)
+
+    if over >= under:
+        lado = "Más de 2.5 Goles"
+        p_lado = over
+    else:
+        lado = "Menos de 2.5 Goles"
+        p_lado = under
+
+    if btts_si >= btts_no:
+        btts = "BTTS Sí"
+        p_btts = btts_si
+    else:
+        btts = "BTTS No"
+        p_btts = btts_no
+
+    # Señal de actividad ofensiva: combina goles y BTTS sin usar EV.
+    actividad = (over + btts_si) / 2.0
+    cierre = (under + btts_no) / 2.0
+
+    return {
+        "lado": lado,
+        "probabilidad": round(_u_clip(p_lado), 1),
+        "btts": btts,
+        "probabilidad_btts": round(_u_clip(p_btts), 1),
+        "actividad": round(_u_clip(actividad), 1),
+        "cierre": round(_u_clip(cierre), 1),
+    }
+
+
+def _u_jack_signal(jack):
+    mercados = jack.get("mercados_valor") or []
+
+    # JackBusca puede devolver mercados con probabilidad y confianza.
+    # Aquí SOLO usamos la señal predictiva; no usamos EV/Edge/score_valor.
+    corners = []
+    tarjetas = []
+
+    for m in mercados:
+        try:
+            nombre = str(m.get("nombre", ""))
+            prob = float(m.get("probabilidad", 0.0) or 0.0)
+            conf = float(m.get("confianza", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            continue
+
+        item = {
+            "nombre": nombre,
+            "probabilidad": _u_clip(prob),
+            "confianza": _u_clip(conf),
+        }
+        if "Córners" in nombre or "Corners" in nombre:
+            corners.append(item)
+        elif "Tarjetas" in nombre:
+            tarjetas.append(item)
+
+    # Si el JackBusca actual no expone una confianza en el mercado,
+    # usamos la confianza del bloque como respaldo.
+    conf_c = float((jack.get("corners") or {}).get("confianza", 0.0) or 0.0)
+    conf_t = float((jack.get("arbitraje") or {}).get("confianza", 0.0) or 0.0)
+
+    corner_top = max(corners, key=lambda x: x["probabilidad"], default=None)
+    tarjeta_top = max(tarjetas, key=lambda x: x["probabilidad"], default=None)
+
+    # Señal de actividad de Jack: mejores probabilidades OVER.
+    over_corners = [
+        x for x in corners
+        if x["nombre"].lower().startswith("más")
+    ]
+    over_tarjetas = [
+        x for x in tarjetas
+        if x["nombre"].lower().startswith("más")
+    ]
+
+    p_over_c = max([x["probabilidad"] for x in over_corners], default=None)
+    p_over_t = max([x["probabilidad"] for x in over_tarjetas], default=None)
+
+    actividad_parts = [x for x in (p_over_c, p_over_t) if x is not None]
+    actividad = sum(actividad_parts) / len(actividad_parts) if actividad_parts else None
+
+    señales_disponibles = int(corner_top is not None) + int(tarjeta_top is not None)
+
+    return {
+        "corners": corner_top,
+        "tarjetas": tarjeta_top,
+        "over_corners_prob": round(p_over_c, 1) if p_over_c is not None else None,
+        "over_tarjetas_prob": round(p_over_t, 1) if p_over_t is not None else None,
+        "actividad": round(_u_clip(actividad), 1) if actividad is not None else None,
+        "confianza_corners": round(_u_clip(conf_c), 1),
+        "confianza_tarjetas": round(_u_clip(conf_t), 1),
+        "señales_disponibles": señales_disponibles,
+    }
+
+
+def _u_build_vector(sim, jack):
+    lado_1x2, p_1x2 = _u_side_from_1x2(sim)
+    goles = _u_goal_signal(sim)
+    jb = _u_jack_signal(jack)
+
+    principal_conf = float(sim.get("confianza_modelo", 0.0) or 0.0)
+    principal_conf = _u_clip(principal_conf)
+
+    # Actividad principal: mayor entre la lectura de goles/BTTS.
+    actividad_principal = max(goles["actividad"], goles["cierre"])
+
+    # Vector explícito: queda disponible para auditoría futura.
+    vector_principal = {
+        "resultado": lado_1x2,
+        "probabilidad_resultado": round(_u_clip(p_1x2), 1),
+        "mercado_goles": goles["lado"],
+        "probabilidad_goles": goles["probabilidad"],
+        "btts": goles["btts"],
+        "probabilidad_btts": goles["probabilidad_btts"],
+        "actividad_ofensiva": goles["actividad"],
+        "tendencia_cierre": goles["cierre"],
+        "confianza": principal_conf,
+    }
+
+    vector_jack = {
+        "corners": jb["corners"],
+        "tarjetas": jb["tarjetas"],
+        "actividad": jb["actividad"],
+        "confianza_corners": jb["confianza_corners"],
+        "confianza_tarjetas": jb["confianza_tarjetas"],
+        "señales_disponibles": jb["señales_disponibles"],
+    }
+
+    return vector_principal, vector_jack
+
+
+def _u_classify(vector_p, vector_j):
+    """
+    Clasificación deliberadamente conservadora.
+
+    CONFLUENCIA:
+      ambos motores apuntan a actividad alta o cierre bajo/alto de
+      forma compatible y ambos tienen datos suficientes.
+
+    CONTRADICCIÓN:
+      Principal y Jack presentan señales de actividad opuestas
+      con diferencia >= 10 puntos.
+
+    COMPLEMENTARIEDAD:
+      no existe conflicto fuerte y cada motor aporta una dimensión
+      distinta con señal suficiente.
+
+    NEUTRO:
+      datos insuficientes o señales demasiado débiles para afirmar
+      una relación.
+    """
+    p_act = vector_p["actividad_ofensiva"]
+    p_close = vector_p["tendencia_cierre"]
+    j_act = vector_j.get("actividad")
+
+    jack_has_signal = vector_j.get("señales_disponibles", 0) > 0
+    if not jack_has_signal or j_act is None:
+        return {
+            "tipo": "NEUTRO",
+            "confianza": round(min(vector_p["confianza"], 60.0), 1),
+            "motivo": "JackBusca no tiene suficientes señales de córners/tarjetas para cruzar ambos vectores.",
+        }
+
+    # Convertimos la señal principal a un eje actividad-vs-cierre.
+    # >50 favorece actividad; <50 favorece cierre.
+    principal_eje = p_act if p_act >= p_close else 100.0 - p_close
+    diferencia = abs(principal_eje - j_act)
+
+    # Alta coincidencia en actividad.
+    if principal_eje >= 65.0 and j_act >= 65.0:
+        conf = min(100.0, (principal_eje + j_act) / 2.0)
+        return {
+            "tipo": "CONFLUENCIA",
+            "confianza": round(conf, 1),
+            "motivo": "El Motor Principal y JackBusca muestran señales compatibles de partido activo.",
+        }
+
+    # Alta coincidencia en cierre.
+    if principal_eje <= 35.0 and j_act <= 35.0:
+        conf = min(100.0, (100.0 - principal_eje + 100.0 - j_act) / 2.0)
+        return {
+            "tipo": "CONFLUENCIA",
+            "confianza": round(conf, 1),
+            "motivo": "Ambos motores muestran señales compatibles de partido de baja actividad.",
+        }
+
+    # Conflicto claro.
+    if diferencia >= 20.0 and (
+        (principal_eje >= 60.0 and j_act <= 40.0)
+        or (principal_eje <= 40.0 and j_act >= 60.0)
+    ):
+        conf = min(100.0, 55.0 + diferencia)
+        return {
+            "tipo": "CONTRADICCIÓN",
+            "confianza": round(conf, 1),
+            "motivo": "Los vectores apuntan en sentidos opuestos respecto a la actividad del partido.",
+        }
+
+    # Señales diferentes pero compatibles.
+    if vector_p["confianza"] >= 55.0 or vector_j.get("señales_disponibles", 0) >= 1:
+        conf = min(85.0, 50.0 + diferencia / 2.0)
+        return {
+            "tipo": "COMPLEMENTARIEDAD",
+            "confianza": round(conf, 1),
+            "motivo": "Los motores aportan dimensiones distintas sin una contradicción suficientemente fuerte.",
+        }
+
+    return {
+        "tipo": "NEUTRO",
+        "confianza": round(min(60.0, (vector_p["confianza"] + j_act) / 2.0), 1),
+        "motivo": "Las señales no son suficientemente fuertes para establecer una relación.",
+    }
+
+
+def _u_predictive_selections(sim, jack):
+    """
+    Selecciones predictivas del Unificado.
+    NO usa EV/Edge ni cuota de la casa.
+    La cuota queda completamente separada de esta capa.
+    """
+    candidatos = []
+
+    def add(nombre, prob, fuente, detalle, conf_extra=0.0):
+        try:
+            p = _u_clip(prob)
+        except Exception:
+            return
+        confianza = min(100.0, max(0.0, 0.70 * p + 0.30 * conf_extra))
+        candidatos.append({
+            "seleccion": nombre,
+            "probabilidad": round(p, 1),
+            "confianza": round(confianza, 1),
+            "fuente": fuente,
+            "detalle": detalle,
+            "accion": "RECOMENDADA" if confianza >= UNIFICADO_MIN_CONFIDENCE else "NO RECOMENDADA",
+        })
+
+    # Principal
+    top1 = _u_side_from_1x2(sim)
+    add(
+        top1[0],
+        top1[1],
+        "Motor Principal",
+        "Mayor probabilidad 1X2 del modelo."
+    )
+
+    over = float(sim.get("over_25", 0.0) or 0.0)
+    under = float(sim.get("under_25", 0.0) or 0.0)
+    btts = float(sim.get("btts_si", 0.0) or 0.0)
+    btts_no = float(sim.get("btts_no", 0.0) or 0.0)
+
+    if over >= under:
+        add("Más de 2.5 Goles", over, "Motor Principal", "Mayor señal del mercado de goles.")
+    else:
+        add("Menos de 2.5 Goles", under, "Motor Principal", "Mayor señal del mercado de goles.")
+
+    if btts >= btts_no:
+        add("Ambos Anotan — Sí", btts, "Motor Principal", "Mayor señal BTTS.")
+    else:
+        add("Ambos Anotan — No", btts_no, "Motor Principal", "Mayor señal BTTS.")
+
+    # JackBusca: solo señales probabilísticas, sin EV/Edge.
+    for key in ("corners", "tarjetas"):
+        item = (_u_jack_signal(jack) or {}).get(key)
+        if item:
+            add(
+                item["nombre"],
+                item["probabilidad"],
+                "JackBusca",
+                "Mayor señal disponible en este bloque.",
+                item.get("confianza", 0.0)
+            )
+
+    candidatos.sort(key=lambda x: (x["confianza"], x["probabilidad"]), reverse=True)
+
+    # No repetimos selecciones iguales.
+    resultado = []
+    vistos = set()
+    for item in candidatos:
+        clave = item["seleccion"].lower()
+        if clave in vistos:
+            continue
+        vistos.add(clave)
+        resultado.append(item)
+        if len(resultado) >= 3:
+            break
+
+    return resultado
+
+
+@app.get("/unificado/partido")
 def unificado_partido(
     request: Request,
     cuota_local: float = 3.03,
@@ -2259,98 +2370,91 @@ def unificado_partido(
     cuota_corners_menos_105: float = None,
 ):
     try:
-        _require_premium(request)
+        # El Unificado mantiene la misma protección comercial de JackBusca.
+        user = _require_premium(request)
 
         sim = simular_escenarios_con_pinnacle(
             cuota_local, cuota_empate, cuota_visitante,
             cuota_mas_25_goles, cuota_menos_25_goles,
             cuota_mas_35_goles, cuota_menos_35_goles,
+            promedio_tarjetas_arbitro=(
+                promedio_tarjetas_arbitro
+                if promedio_tarjetas_arbitro is not None
+                else 4.5
+            ),
+            c_t_mas_35=cuota_tarjetas_mas_35 or 1.80,
+            c_t_menos_35=cuota_tarjetas_menos_35 or 2.00,
+            c_t_mas_45=cuota_tarjetas_mas_45 or 2.50,
+            c_t_menos_45=cuota_tarjetas_menos_45 or 1.50,
+            c_t_mas_55=cuota_tarjetas_mas_55 or 3.50,
+            c_t_menos_55=cuota_tarjetas_menos_55 or 1.25,
+            c_c_mas_75=cuota_corners_mas_75 or 1.20,
+            c_c_menos_75=cuota_corners_menos_75 or 4.00,
+            c_c_mas_85=cuota_corners_mas_85 or 1.45,
+            c_c_menos_85=cuota_corners_menos_85 or 2.60,
+            c_c_mas_95=cuota_corners_mas_95 or 1.85,
+            c_c_menos_95=cuota_corners_menos_95 or 1.90,
+            c_c_mas_105=cuota_corners_mas_105 or 2.40,
+            c_c_menos_105=cuota_corners_menos_105 or 1.55,
             cuota_btts_si=cuota_btts_si,
             cuota_btts_no=cuota_btts_no
         )
 
-        lineas_t = [
-            (3.5, cuota_tarjetas_mas_35, cuota_tarjetas_menos_35),
-            (4.5, cuota_tarjetas_mas_45, cuota_tarjetas_menos_45),
-            (5.5, cuota_tarjetas_mas_55, cuota_tarjetas_menos_55),
-        ]
-        lineas_c = [
-            (7.5, cuota_corners_mas_75, cuota_corners_menos_75),
-            (8.5, cuota_corners_mas_85, cuota_corners_menos_85),
-            (9.5, cuota_corners_mas_95, cuota_corners_menos_95),
-            (10.5, cuota_corners_mas_105, cuota_corners_menos_105),
-        ]
-
-        lam_t, conf_t, fuente_t, _, n_t = _lambda_tarjetas_v3(
-            promedio_tarjetas_arbitro, lineas_t
-        )
-        lam_c, _, n_c = _lambda_corners_desde_mercado(lineas_c)
-
-        if lam_c is None and promedio_esperado_corners is not None and promedio_esperado_corners > 0:
-            lam_c = float(promedio_esperado_corners)
-
-        if lam_c is not None and promedio_esperado_corners is not None and promedio_esperado_corners > 0 and n_c:
-            lam_c = .75 * lam_c + .25 * float(promedio_esperado_corners)
-
-        conf_c = _confianza_corners_v3(
-            n_c, promedio_esperado_corners is not None and promedio_esperado_corners > 0
+        jack = jackbusca_partido(
+            request=request,
+            promedio_tarjetas_arbitro=promedio_tarjetas_arbitro,
+            promedio_esperado_corners=promedio_esperado_corners,
+            cuota_tarjetas_mas_35=cuota_tarjetas_mas_35,
+            cuota_tarjetas_menos_35=cuota_tarjetas_menos_35,
+            cuota_tarjetas_mas_45=cuota_tarjetas_mas_45,
+            cuota_tarjetas_menos_45=cuota_tarjetas_menos_45,
+            cuota_tarjetas_mas_55=cuota_tarjetas_mas_55,
+            cuota_tarjetas_menos_55=cuota_tarjetas_menos_55,
+            cuota_corners_mas_75=cuota_corners_mas_75,
+            cuota_corners_menos_75=cuota_corners_menos_75,
+            cuota_corners_mas_85=cuota_corners_mas_85,
+            cuota_corners_menos_85=cuota_corners_menos_85,
+            cuota_corners_mas_95=cuota_corners_mas_95,
+            cuota_corners_menos_95=cuota_corners_menos_95,
+            cuota_corners_mas_105=cuota_corners_mas_105,
+            cuota_corners_menos_105=cuota_corners_menos_105,
+            internal_unificado=True
         )
 
-        corners_mas, corners_menos = ({}, {})
-        if lam_c is not None:
-            corners_mas, corners_menos = _probabilidades_con_lambda_total(lam_c, [7.5,8.5,9.5,10.5])
+        vector_p, vector_j = _u_build_vector(sim, jack)
+        lectura = _u_classify(vector_p, vector_j)
+        selecciones = _u_predictive_selections(sim, jack)
 
-        tarjetas_mas, tarjetas_menos = ({}, {})
-        if lam_t is not None:
-            tarjetas_mas, tarjetas_menos = _probabilidades_con_lambda_total(lam_t, [3.5,4.5,5.5])
-
-        mercados_jack = []
-        if lam_t is not None:
-            for linea in [3.5,4.5,5.5]:
-                mercados_jack += [
-                    _evaluar_mercado_jack_v3(f"Más {linea} Tarjetas", tarjetas_mas[linea], confianza=conf_t),
-                    _evaluar_mercado_jack_v3(f"Menos {linea} Tarjetas", tarjetas_menos[linea], confianza=conf_t),
-                ]
-        if lam_c is not None:
-            for linea in [7.5,8.5,9.5,10.5]:
-                mercados_jack += [
-                    _evaluar_mercado_jack_v3(f"Más {linea} Córners", corners_mas[linea], confianza=conf_c),
-                    _evaluar_mercado_jack_v3(f"Menos {linea} Córners", corners_menos[linea], confianza=conf_c),
-                ]
-
-        vector_p = _vector_principal(sim)
-        vector_j = _vector_jackbusca(mercados_jack, conf_c, conf_t)
-        unificado = _unificar_vectores(vector_p, vector_j)
-
-        candidatos = [m for m in mercados_jack if m and m["confianza"] >= JACK_MIN_CONFIDENCE]
-        candidatos.sort(key=lambda x: (x["confianza"], abs(x["probabilidad"] - 50)), reverse=True)
+        historial_info = _save_analysis_if_allowed(
+            user,
+            "Motor Unificado v2 | Lectura Predictiva",
+            {
+                "lectura_unificada": lectura,
+                "vector_principal": vector_p,
+                "vector_jackbusca": vector_j,
+                "top_3_selecciones": selecciones,
+            }
+        )
 
         return {
-            "origen": "API Master Pro - Motor Unificado v9.0",
+            "origen": "Motor Unificado Predictivo v2",
+            "regla_principal": "La lectura predictiva NO utiliza EV/Edge. Las cuotas de la casa son una capa independiente de valor.",
             "motor_principal": {
                 "vector": vector_p,
-                "probabilidades": {
-                    "local": sim["p_1"],
-                    "empate": sim["p_x"],
-                    "visitante": sim["p_2"],
-                    "over_25": sim["over_25"],
-                    "under_25": sim["under_25"],
-                    "btts_si": sim["btts_si"],
-                    "btts_no": sim["btts_no"]
-                },
-                "escenarios": sim.get("escenarios", 50000)
+                "escenarios": sim.get("escenarios", 50000),
             },
             "jackbusca": {
                 "vector": vector_j,
-                "top_3_selecciones": candidatos[:3]
+                "escenarios": jack.get("escenarios", 50000),
             },
-            "lectura_unificada": unificado,
-            "top_3_selecciones": candidatos[:3],
-            "regla_recomendacion": "Solo mostrar selección como RECOMENDADA cuando la confianza sea >=65%. EV/Edge no cambia la predicción.",
-            "estado": "OK"
+            "lectura_unificada": lectura,
+            "top_3_selecciones": selecciones,
+            "min_confianza_recomendada": UNIFICADO_MIN_CONFIDENCE,
+            "historial_info": historial_info,
+            "estado": "OK",
         }
 
     except HTTPException:
         raise
     except Exception as e:
-        return {"error": f"Error en Motor Unificado: {str(e)}"}
+        return {"error": f"Error en Motor Unificado: {type(e).__name__}: {str(e)}"}
