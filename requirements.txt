@@ -1,3 +1,9 @@
 fastapi
 uvicorn
-pydantic
+requests
+beautifulsoup4
+selenium
+psycopg2-binary
+sqlalchemy
+passlib[bcrypt]
+python-jose[cryptography]
